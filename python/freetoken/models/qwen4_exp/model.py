@@ -89,6 +89,9 @@ class Qwen4ExpDecoderLayer(BaseOP):
 class Qwen4ExpModel(BaseOP):
     def __init__(self, config: ModelConfig, *, prefix: str = "model") -> None:
         self.hc_count = config.qwen4_args.hc_count
+        #: Ширина остатка: четыре потока гиперсоединений по hidden каждый.
+        #: Единственная величина, о которой стадиям надо договориться.
+        self.stream_width = self.hc_count * config.hidden_size
         # Стадия конвейера строит только свои слои, а края — только те, кому
         # они достались: эмбеддинги у первой, смеситель и lm_head у последней.
         # Без диапазона всё это True, и модель собирается ровно как раньше.
@@ -128,8 +131,20 @@ class Qwen4ExpModel(BaseOP):
         стадия и отдаёт его как есть, не собирая потоки смесителем.
         """
         if hidden is None:
+            if self.embed_tokens is None:
+                raise ValueError(
+                    "стадия без эмбеддингов не получила остаток предыдущей: "
+                    "его кладут в batch.stage_hidden, и считать без него нечего"
+                )
             hidden = embed_input_ids(self.embed_tokens, input_ids, batch)
             hidden = hidden.repeat(1, self.hc_count)
+        elif hidden.shape[-1] != self.stream_width:
+            # Единственное, о чём стадии договариваются. Разошлись — дальше
+            # поедет молча испорченный ответ, а не отказ.
+            raise ValueError(
+                f"остаток шириной {hidden.shape[-1]}, ожидалось {self.stream_width} "
+                f"(hc_count={self.hc_count})"
+            )
         meta = None
         if self._ple:
             from .ple import build_ple_metadata, commit_ngram_context
@@ -233,12 +248,25 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             )
         return table.bank.nbytes
 
+    @property
+    def produces_logits(self) -> bool:
+        """Считает ли эта стадия логиты.
+
+        Логиты есть только у последней. У остальных ``forward`` отдаёт
+        остаток, и сэмплировать из него — молча выдавать мусор, поэтому
+        зовущий обязан спросить, а не предполагать.
+        """
+        return self.lm_head is not None
+
     def forward(self) -> torch.Tensor:
+        """Свои слои. Логиты у последней стадии, остаток у остальных.
+
+        Вход не-первой стадии — ``batch.stage_hidden``: остаток, посчитанный
+        предыдущей. Положить его туда — дело того, кто ведёт конвейер.
+        """
         batch = get_global_ctx().batch
-        hidden = self.model.forward(batch.input_ids, batch)
+        hidden = self.model.forward(batch.input_ids, batch, hidden=batch.stage_hidden)
         if self.lm_head is None:
-            # Промежуточная стадия логитов не считает: её выход — остаток, и
-            # везти его дальше должен тот, кто вызывает (шов, фаза 2).
             return hidden
         return self.lm_head.forward(hidden)
 

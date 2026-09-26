@@ -135,6 +135,10 @@ class Batch:
     active_table_idx: "torch.Tensor | None" = None
     # this field should be set by attention backend
     attn_metadata: BaseAttnMetadata = field(init=False)
+    # Остаток предыдущей стадии конвейера, ``R [T, hc_count*hidden]``. Стоит
+    # рядом с mm_embeds не случайно: оба подменяют то, что стадия иначе взяла
+    # бы из эмбеддингов. None у первой стадии и у целой модели.
+    stage_hidden: torch.Tensor | None = field(default=None, init=False)
     # concatenated multimodal soft-token embeddings for a prefill batch (or None) and the batch rows they land on
     mm_embeds: torch.Tensor | None = field(default=None, init=False)
     mm_rows: torch.Tensor | None = field(default=None, init=False)

@@ -25,7 +25,7 @@ from freetoken.distributed import get_tp_info
 from freetoken.models.qwen3_vl.weight import rename_vl_prefix
 
 from freetoken.models.config import VISION_KEY_PREFIXES
-from freetoken.models.loader import ShardReader, drop_page_cache, iter_weight_files
+from freetoken.models.loader import drop_page_cache, iter_weight_files
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
 )
@@ -438,10 +438,15 @@ def _stacked_bf16_pieces(model_path: str, config) -> Iterator["Piece"]:
 
     Serial by design, not as a fallback: ``experts_scattered`` calls this layout "pre-packed
     into a few large tensors", where a whole-shard parallel read only adds amplification --
-    each ``gate_up_proj`` is 3.36 GiB and already fills one shard on its own. Peak extra host
-    memory is one layer (~5.03 GiB), because the consumer packs each piece into its bank
-    before pulling the next.
+    each ``gate_up_proj`` is 3.36 GiB and already fills one shard on its own.
+
+    Page cache is dropped per shard once the consumer has packed the piece, for the reason
+    ``drop_page_cache`` states: banks and the checkpoint's cache do not both fit in host RAM.
+    The bf16 pool is 225 GiB, so on a host sized for it the duplicate is the difference
+    between loading and being reaped. Peak extra host memory is one layer (~5.03 GiB).
     """
+    from freetoken.models.loader import safetensors_weight_map
+
     experts = int(config.num_experts)
     hidden = int(config.hidden_size)
     intermediate = int(config.moe_intermediate_size)
@@ -449,28 +454,36 @@ def _stacked_bf16_pieces(model_path: str, config) -> Iterator["Piece"]:
     dense = int(config.num_layers) - layers
     shapes = {"gate_up": (experts, 2 * intermediate, hidden), "down": (experts, hidden, intermediate)}
 
-    reader = ShardReader(model_path, torch.device("cpu"))
-    try:
-        for bank_layer in tqdm(
-            range(layers), desc="Loading bf16 experts", disable=not get_tp_info().is_primary()
-        ):
-            piece: dict[str, torch.Tensor] = {}
-            for role, leaf in (("gate_up", "gate_up_proj"), ("down", "down_proj")):
-                name = _STACKED_EXPERT_KEY.format(layer=dense + bank_layer, leaf=leaf)
-                if not reader.has(name):
-                    raise ValueError(f"checkpoint has no stacked routed experts at {name}")
-                tensor = reader.get_tensor(name)
-                if tuple(tensor.shape) != shapes[role]:
-                    raise ValueError(
-                        f"{name} is {tuple(tensor.shape)}, expected {shapes[role]} "
-                        f"(num_experts={experts}, hidden={hidden}, moe_intermediate={intermediate})"
-                    )
-                if tensor.dtype is not torch.bfloat16:
-                    raise ValueError(f"{name} is {tensor.dtype}, expected bfloat16")
-                piece[role] = tensor
-            yield bank_layer, 0, experts, piece
-    finally:
-        reader.close()
+    folder = download_hf_weight(model_path)
+    weight_map = safetensors_weight_map(folder)
+
+    for bank_layer in tqdm(
+        range(layers), desc="Loading bf16 experts", disable=not get_tp_info().is_primary()
+    ):
+        piece: dict[str, torch.Tensor] = {}
+        paths: list[str] = []
+        for role, leaf in (("gate_up", "gate_up_proj"), ("down", "down_proj")):
+            name = _STACKED_EXPERT_KEY.format(layer=dense + bank_layer, leaf=leaf)
+            shard = weight_map.get(name)
+            if shard is None:
+                raise ValueError(f"checkpoint has no stacked routed experts at {name}")
+            path = os.path.join(folder, shard)
+            with safetensors.safe_open(path, framework="pt", device="cpu") as f:
+                tensor = f.get_tensor(name)
+            if tuple(tensor.shape) != shapes[role]:
+                raise ValueError(
+                    f"{name} is {tuple(tensor.shape)}, expected {shapes[role]} "
+                    f"(num_experts={experts}, hidden={hidden}, moe_intermediate={intermediate})"
+                )
+            if tensor.dtype is not torch.bfloat16:
+                raise ValueError(f"{name} is {tensor.dtype}, expected bfloat16")
+            piece[role] = tensor
+            paths.append(path)
+        yield bank_layer, 0, experts, piece
+        # После yield: консьюмер уже упаковал кусок в банк, и те же байты
+        # больше не нужны в кэше. Сам кусок не трогаем — он принадлежит ему.
+        for path in dict.fromkeys(paths):
+            drop_page_cache(path)
 
 
 def iter_expert_pieces(

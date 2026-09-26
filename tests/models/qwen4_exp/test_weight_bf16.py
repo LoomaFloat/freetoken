@@ -393,3 +393,28 @@ def test_the_fp8_disk_source_still_needs_its_scale(tmp_path):
 
     with pytest.raises(ValueError, match="no weight_scale"):
         _disk_source(path)
+
+
+def test_each_shard_leaves_the_page_cache_after_its_piece(checkpoint, monkeypatch):
+    """Банк и кэш чекпоинта не помещаются в RAM вдвоём — так и написано в
+    `drop_page_cache`. На bf16 пул 225 ГиБ, и дубликат в кэше решает, встанет
+    модель или узел её прибьёт. Сбрасывать можно только ПОСЛЕ того, как
+    консьюмер упаковал кусок, иначе байты придётся читать снова."""
+    import freetoken.models.qwen4_exp.weight as weight
+
+    dropped: list[str] = []
+    monkeypatch.setattr(weight, "drop_page_cache", lambda path: dropped.append(path))
+
+    path, _raw = checkpoint
+    # По генератору, а не по собранному списку: важен ПОРЯДОК сброса
+    # относительно выдачи куска.
+    pieces = weight.iter_expert_pieces(path, _config(path), QuantKind.NONE)
+
+    first = next(pieces)
+    assert not dropped, "сброс до того, как консьюмер забрал первый кусок"
+    assert first[3]["gate_up"].shape == (E, 2 * I, H), "кусок испорчен"
+
+    rest = list(pieces)
+    assert dropped, "страничный кэш не сбрасывается вовсе"
+    assert all(p.endswith(".safetensors") for p in dropped), dropped
+    assert rest[-1][3]["down"].shape == (E, H, I), "последний кусок испорчен"

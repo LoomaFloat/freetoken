@@ -26,6 +26,7 @@ from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_fa
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
+from .stage import StageLink, graphs_allowed, stage_input, stage_output
 from freetoken.kvcache import create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
 from freetoken.kvcache.cache_status import _supports_swa_ratio
@@ -313,6 +314,9 @@ class Engine:
         torch.cuda.set_stream(self.stream)
         self.dtype = config.dtype
         self.config = config  # retained for runtime cache rebuild (rebuild_runtime_cache)
+        #: Соседи по конвейеру; None — стадия одна и модель целая. Ставится
+        #: тем, кто ведёт конвейер, после сборки движка.
+        self.stage_link: StageLink | None = None
         # KV pool family fixed at construction from the model config: its classmethods own the
         # page-token geometry and cost arithmetic the engine needs BEFORE the pool exists
         # (num_pages sizing, --moe-cache-auto); the instance owns rebuild/validation after.
@@ -988,9 +992,13 @@ class Engine:
         assert torch.cuda.current_stream() == self.stream
         if batch.mm_gather_plan:
             self._run_mm_encoder(batch)
-        use_graph = self.graph_runner.can_use_cuda_graph(batch)
+        stage_input(batch, link=self.stage_link, model_config=self.config.model_config)
+        use_graph = (
+            graphs_allowed(self.config.model_config)
+            and self.graph_runner.can_use_cuda_graph(batch)
+        )
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
-            logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+            out = self.graph_runner.replay(batch) if use_graph else self.model.forward()
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
@@ -999,8 +1007,14 @@ class Engine:
         for req in batch.reqs:
             req.complete_one()
 
-        batch_logits = logits[: batch.size]
-        next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+        # У последней стадии `out` — логиты, у остальных остаток; решает
+        # `produces_logits`, а не форма.
+        next_tokens_gpu = stage_output(
+            batch, out,
+            link=self.stage_link,
+            produces_logits=self.model.produces_logits,
+            sample=lambda logits: self.sampler.sample(logits[: batch.size], args).to(torch.int32),
+        )
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)

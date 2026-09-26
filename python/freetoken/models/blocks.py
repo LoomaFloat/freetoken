@@ -29,6 +29,16 @@ class BaseLLMModel(ABC, BaseOP):
     @abstractmethod
     def forward(self) -> torch.Tensor: ...
 
+    @property
+    def produces_logits(self) -> bool:
+        """Считает ли ``forward`` логиты.
+
+        Целая модель — да. Не-последняя стадия конвейера отдаёт вместо них
+        остаток, и сэмплировать из него значит молча выдавать мусор, поэтому
+        движок спрашивает, а не смотрит на форму тензора.
+        """
+        return True
+
     @contextmanager
     def forward_host_ctx(self, batch: Batch, use_graph: bool):
         """Around one forward dispatch: enter before it is enqueued, exit right after. A backend that feeds the forward from host memory overrides this."""

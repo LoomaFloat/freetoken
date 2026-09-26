@@ -216,3 +216,133 @@ def test_the_ngram_table_goes_to_the_stage_that_owns_its_layer():
 
     assert [ple.args is not None for ple in head.ple_layers] == [True]
     assert tail.ple_layers == []
+
+
+# ------------------------------------------------------------------ связь стадий
+#
+# Проверяется ХОРЕОГРАФИЯ: движок зовёт те же `stage_input` / `stage_output`,
+# так что тест проверяет шов, а не свою имитацию движка.
+
+from freetoken.engine.stage import (  # noqa: E402
+    StageLink, graphs_allowed, needs_incoming, stage_input, stage_output,
+)
+
+
+def _argmax(out: torch.Tensor) -> torch.Tensor:
+    """Детерминированный «сэмплер»: от настоящего нужен только повтор."""
+    return out.argmax(dim=-1).to(torch.int32)
+
+
+class Pair(StageLink):
+    """Хвост, вызываемый прямо из шва.
+
+    Обмен синхронный, и в одном потоке он выглядит так: голова отдаёт остаток
+    и просит токены — хвост считает ровно в этот момент. Порядок вызовов тот
+    же, что был бы по сети.
+    """
+
+    def __init__(self, tail, tail_config, batch):
+        self.tail, self.tail_config, self.batch = tail, tail_config, batch
+        self.calls: list[str] = []
+        self.remainder = None
+        self.published = None
+
+    def take(self, batch):
+        self.calls.append("take")
+        return self.remainder
+
+    def give(self, batch, remainder):
+        self.calls.append("give")
+        self.remainder = remainder
+
+    def tokens(self, batch):
+        self.calls.append("tokens")
+        stage_input(self.batch, link=self, model_config=self.tail_config)
+        out = self.tail.forward(self.batch.input_ids, self.batch, hidden=self.batch.stage_hidden)
+        return stage_output(self.batch, out, link=self, produces_logits=True, sample=_argmax)
+
+    def publish(self, batch, tokens):
+        self.calls.append("publish")
+        self.published = tokens
+
+
+def test_a_pair_of_stages_chooses_the_same_token_as_the_whole_model():
+    """Полный круг шва: остаток вперёд, токен назад, и голова получает ровно
+    тот токен, который выбрал хвост."""
+    batch = _batch()
+    whole = _model().forward(batch.input_ids, batch)
+    expected = _argmax(whole)
+
+    clear_stage_info()
+    head, head_config = _model("0:2"), _config("0:2")
+    clear_stage_info()
+    tail_batch = _batch()
+    link = Pair(_model("2:4"), _config("2:4"), tail_batch)
+
+    stage_input(batch, link=link, model_config=head_config)
+    out = head.forward(batch.input_ids, batch, hidden=batch.stage_hidden)
+    got = stage_output(batch, out, link=link, produces_logits=False, sample=_argmax)
+
+    assert torch.equal(got, expected)
+    assert link.calls == ["give", "tokens", "take", "publish"]
+    assert torch.equal(link.published, expected), "хвост разослал не то, что выбрал"
+
+
+def test_the_head_never_samples_from_the_remainder():
+    """Сэмпл из остатка — это молча выданный мусор, и решает не форма
+    тензора, а `produces_logits`."""
+    batch = _batch()
+    clear_stage_info()
+    link = Pair(_model("2:4"), _config("2:4"), _batch())
+    sampled = []
+
+    stage_output(batch, torch.zeros(3, 512), link=link,
+                 produces_logits=False, sample=lambda out: sampled.append(out))
+
+    assert sampled == [], "голова сэмплировала сама"
+
+
+def test_the_last_stage_publishes_what_it_sampled():
+    batch = _batch()
+    link = Pair(None, None, batch)
+
+    tokens = stage_output(batch, torch.eye(3, 5), link=link,
+                          produces_logits=True, sample=_argmax)
+
+    assert link.calls == ["publish"]
+    assert torch.equal(link.published, tokens)
+
+
+def test_a_stage_that_needs_the_remainder_and_has_no_link_refuses():
+    """Иначе стадия посчитала бы из пустоты и не сказала бы об этом."""
+    clear_stage_info()
+    config = _config("2:4")
+
+    with pytest.raises(RuntimeError, match="не с нулевого слоя"):
+        stage_input(_batch(), link=None, model_config=config)
+
+
+def test_a_stage_with_nowhere_to_hand_off_refuses():
+    with pytest.raises(RuntimeError, match="отдать остаток некому"):
+        stage_output(_batch(), torch.zeros(3, 512), link=None,
+                     produces_logits=False, sample=_argmax)
+
+
+def test_the_first_stage_asks_for_nothing():
+    batch = _batch()
+    clear_stage_info()
+    link = Pair(None, None, batch)
+
+    stage_input(batch, link=link, model_config=_config("0:2"))
+
+    assert link.calls == []
+    assert batch.stage_hidden is None
+    assert not needs_incoming(_config("0:2"))
+
+
+def test_graphs_are_off_on_a_stage():
+    """Вход не-первой стадии приезжает снаружи, а граф требует фиксированного
+    буфера. Пока это не сделано — eager: медленнее, но не молча неправильно."""
+    assert graphs_allowed(_config())
+    clear_stage_info()
+    assert not graphs_allowed(_config("2:4"))

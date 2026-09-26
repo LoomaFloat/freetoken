@@ -14,14 +14,11 @@ from .model import Qwen4ExpForCausalLM, Qwen4ExpForConditionalGeneration
 from .weight import (
     ftw_side_files,
     nvfp4_expert_spec,
+    iter_expert_pieces,
     iter_vision_weights,
     iter_weights,
     load_ple_table,
 )
-
-# Official FP8 checkpoints share qwen3_5_moe's block-fp8 expert layout (same
-# model.language_model.layers.* keys), so reuse its expert reader.
-from freetoken.models.qwen3_5_moe.weight import iter_expert_pieces
 
 __all__ = [
     "ftw_side_files",

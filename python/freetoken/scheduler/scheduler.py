@@ -64,8 +64,10 @@ ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 class Scheduler(SchedulerIOMixin):
     def __init__(self, config: SchedulerConfig):
         from freetoken.engine import Engine
+        from freetoken.engine.stage import attach_stage_link
 
         self.engine = Engine(config)
+        attach_stage_link(self.engine, config)
 
         # use another stream to overlap metadata processing with computation
         self.device = self.engine.device

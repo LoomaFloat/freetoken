@@ -36,6 +36,12 @@ class EngineConfig:
     #: конвейера. Пусто — вся модель. Делится ради ПАМЯТИ ХОСТА: пул
     #: экспертов живёт в ней, и на одном хосте он целиком не помещается.
     layer_range: str = ""
+    #: Связь с соседями по конвейеру. Посредник рядом со стадией знает, где
+    #: сосед; сюда отдают, оттуда принимают. Пусто — стадия одна.
+    stage_send_url: str = ""
+    stage_listen_port: int = 0
+    stage_rank: int = 0
+    stage_size: int = 1
     # Expert-bank host load (--expert-load): auto|serial|parallel. "auto" reads scattered
     # experts in parallel but falls back to serial when free RAM can't cover the banks + the
     # parallel reader's extra (non-reclaimable) whole-shard buffer; "serial" forces the

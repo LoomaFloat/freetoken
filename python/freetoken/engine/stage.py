@@ -113,4 +113,37 @@ def stage_output(
     return tokens
 
 
-__all__ = ["StageLink", "graphs_allowed", "needs_incoming", "stage_input", "stage_output"]
+__all__ = ["StageLink", "attach_stage_link", "graphs_allowed", "needs_incoming",
+           "stage_input", "stage_output"]
+
+
+def attach_stage_link(engine, config) -> None:
+    """Дать движку связь с соседями, если он стадия конвейера.
+
+    Отказ здесь, а не на первом токене. Стадия с отрезком слоёв, но без связи
+    доходит до первого forward и падает там — через минуты после старта и
+    после того, как веса уже в памяти. Дешевле сказать сразу.
+    """
+    span = getattr(config, "layer_range", "")
+    url = getattr(config, "stage_send_url", "")
+    if not url:
+        if span:
+            raise ValueError(
+                "--layer-range задан, но --stage-send-url нет: стадии не с кем "
+                "обмениваться остатком, и ответа не будет"
+            )
+        return
+    if not span:
+        raise ValueError(
+            "--stage-send-url задан, но --layer-range нет: целая модель "
+            "соседей не имеет, и связь была бы ни к чему"
+        )
+    from .stage_http import HttpStageLink
+
+    engine.stage_link = HttpStageLink(
+        send_url=url,
+        listen_port=int(getattr(config, "stage_listen_port", 0) or 0),
+        rank=int(getattr(config, "stage_rank", 0) or 0),
+        size=int(getattr(config, "stage_size", 1) or 1),
+        device=engine.device,
+    )

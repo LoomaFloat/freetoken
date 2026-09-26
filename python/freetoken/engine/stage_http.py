@@ -1,0 +1,193 @@
+"""Связь стадий поверх HTTP: остаток вперёд, выбранные токены назад.
+
+Почему HTTP и почему один адрес. Стадии живут на разных машинах за NAT и
+друг к другу не ходят: рядом с каждой есть посредник, который знает, где
+сосед, и умеет до него добраться. Поэтому здесь ровно два адреса — куда
+отдавать и на каком порту принимать, — а маршрутизацию по рангам делает
+посредник, читая заголовок назначения.
+
+Формат тела — сырые байты тензора; форма и тип едут заголовками. Никакого
+base64: остаток на декоде это 20 КБ, и удваивать их кодированием незачем.
+
+Неизвестный тип НЕ угадывается. Угадывание — это как конвейер из разных
+сборок превращается в уверенно работающую чушь, а это худшее, что такая
+система может выдать.
+"""
+
+from __future__ import annotations
+
+import http.client
+import queue
+import threading
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Dict
+
+import torch
+
+from freetoken.core import Batch
+from freetoken.utils import init_logger
+
+from .stage import StageLink
+
+logger = init_logger(__name__)
+
+#: Имена типов — договор между процессами, которые могут быть разных сборок.
+#: Добавить имя сюда значит поменять протокол.
+DTYPES: Dict[str, torch.dtype] = {
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+    "float32": torch.float32,
+    "int32": torch.int32,
+    "int64": torch.int64,
+}
+NAMES = {value: key for key, value in DTYPES.items()}
+
+KIND = "X-Looma-Stage-Kind"        # remainder | tokens
+SHAPE = "X-Looma-Stage-Shape"      # "3,10240"
+DTYPE = "X-Looma-Stage-Dtype"
+STEP = "X-Looma-Stage-Step"        # номер шага: рассинхрон должен быть слышен
+TO = "X-Looma-Stage-To"            # ранг назначения или "*" — всем остальным
+
+REMAINDER, TOKENS = "remainder", "tokens"
+
+
+class StageProtocolError(RuntimeError):
+    """Сосед прислал то, чего эта стадия не понимает."""
+
+
+def pack(tensor: torch.Tensor) -> tuple[bytes, str, str]:
+    """Тензор -> (байты, форма, имя типа).
+
+    Читается через uint8, а не через `.numpy()`: у numpy нет bfloat16 и он бы
+    отказался. Байты при этом те же — на той стороне их соберёт torch,
+    который тип знает.
+    """
+    flat = tensor.detach().to("cpu").contiguous()
+    name = NAMES.get(flat.dtype)
+    if name is None:
+        raise StageProtocolError(f"тип {flat.dtype} не ездит по этому протоколу")
+    return flat.view(torch.uint8).numpy().tobytes(), ",".join(map(str, flat.shape)), name
+
+
+def unpack(data: bytes, shape: str, dtype: str, *, device: torch.device) -> torch.Tensor:
+    """(байты, форма, имя типа) -> тензор, ровно такой, каким его отправили."""
+    name = (dtype or "").strip()
+    if name not in DTYPES:
+        raise StageProtocolError(
+            f"сосед прислал {name!r}, а эта стадия знает только "
+            f"{', '.join(sorted(DTYPES))}. Стадии конвейера должны быть одной сборки"
+        )
+    dims = tuple(int(x) for x in shape.split(",") if x != "")
+    flat = torch.frombuffer(bytearray(data), dtype=DTYPES[name])
+    return flat.reshape(dims).to(device)
+
+
+class HttpStageLink(StageLink):
+    """Соседи по конвейеру через локального посредника.
+
+    Приём асинхронный: сообщение может прийти раньше, чем стадия его
+    попросит, поэтому оно кладётся в очередь по виду. Виды разделены, потому
+    что средняя стадия ждёт и остаток от предыдущей, и токены с хвоста.
+
+    Номер шага проверяется на приёме. Рассинхрон стадий — это молча неверный
+    ответ, а не отказ, поэтому он должен быть слышен на первом же
+    несовпадении.
+    """
+
+    def __init__(self, *, send_url: str, listen_port: int, rank: int, size: int,
+                 device: torch.device, timeout_s: float = 300.0) -> None:
+        self.send_url = send_url.rstrip("/")
+        self.rank, self.size = rank, size
+        self.device = device
+        self.timeout_s = timeout_s
+        # ОДИН счётчик на обе стороны. Шаг конвейера общий: на шаге k голова
+        # отдаёт остаток(k), хвост принимает(k) и публикует токены(k), и
+        # только после этого все переходят к k+1. Два счётчика разошлись бы
+        # на первой же стадии, которая не публикует.
+        self._step = 0
+        self._inbox: Dict[str, queue.Queue] = {REMAINDER: queue.Queue(), TOKENS: queue.Queue()}
+        self._server = self._listen(listen_port)
+
+    # ------------------------------------------------------------ приём
+    def _listen(self, port: int) -> ThreadingHTTPServer:
+        inbox = self._inbox
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length) if length else b""
+                kind = self.headers.get(KIND, "")
+                if kind not in inbox:
+                    self.send_response(400)
+                    self.end_headers()
+                    return
+                inbox[kind].put((body, self.headers.get(SHAPE, ""),
+                                 self.headers.get(DTYPE, ""), self.headers.get(STEP, "")))
+                self.send_response(202)
+                self.end_headers()
+
+        server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        threading.Thread(target=server.serve_forever, name="stage-link", daemon=True).start()
+        logger.info_rank0(f"связь стадии слушает 127.0.0.1:{server.server_address[1]}")
+        return server
+
+    def _await(self, kind: str) -> torch.Tensor:
+        try:
+            body, shape, dtype, step = self._inbox[kind].get(timeout=self.timeout_s)
+        except queue.Empty:
+            raise StageProtocolError(
+                f"сосед не прислал {kind} за {self.timeout_s:g} с; конвейер встал"
+            ) from None
+        if step != "" and int(step) != self._step:
+            raise StageProtocolError(
+                f"{kind} пришёл с шага {step}, а эта стадия на {self._step}: стадии разошлись"
+            )
+        return unpack(body, shape, dtype, device=self.device)
+
+    # ------------------------------------------------------------ отправка
+    def _post(self, kind: str, tensor: torch.Tensor, to: str) -> None:
+        body, shape, dtype = pack(tensor)
+        parts = urllib.parse.urlsplit(self.send_url)
+        connection = http.client.HTTPConnection(parts.netloc, timeout=self.timeout_s)
+        try:
+            connection.request("POST", parts.path or "/", body=body, headers={
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(len(body)),
+                KIND: kind, SHAPE: shape, DTYPE: dtype,
+                STEP: str(self._step), TO: to,
+            })
+            answer = connection.getresponse()
+            answer.read()
+            if answer.status >= 300:
+                raise StageProtocolError(f"посредник отказал на {kind}: HTTP {answer.status}")
+        finally:
+            connection.close()
+
+    # ------------------------------------------------------------ StageLink
+    def take(self, batch: Batch) -> torch.Tensor:
+        return self._await(REMAINDER)
+
+    def give(self, batch: Batch, remainder: torch.Tensor) -> None:
+        self._post(REMAINDER, remainder, to=str(self.rank + 1))
+
+    def tokens(self, batch: Batch) -> torch.Tensor:
+        got = self._await(TOKENS)
+        self._step += 1      # шаг этой стадии закончился
+        return got
+
+    def publish(self, batch: Batch, tokens: torch.Tensor) -> None:
+        # Всем остальным: токен решает, что подать на вход следующим шагом, и
+        # не узнав его, любая стадия разойдётся с остальными.
+        self._post(TOKENS, tokens, to="*")
+        self._step += 1      # шаг этой стадии закончился
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+
+__all__ = ["DTYPES", "HttpStageLink", "StageProtocolError", "pack", "unpack"]

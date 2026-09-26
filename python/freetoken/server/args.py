@@ -626,6 +626,21 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--stage-send-url",
+        default=ServerArgs.stage_send_url,
+        help=(
+            "Where this pipeline stage hands messages to its local mediator (which knows "
+            "where the neighbours are). Empty = a single stage."
+        ),
+    )
+    parser.add_argument("--stage-listen-port", type=int, default=ServerArgs.stage_listen_port,
+                        help="Port this stage accepts the remainder and the chosen tokens on.")
+    parser.add_argument("--stage-rank", type=int, default=ServerArgs.stage_rank,
+                        help="This stage's index in the pipeline.")
+    parser.add_argument("--stage-size", type=int, default=ServerArgs.stage_size,
+                        help="How many stages the pipeline has.")
+
+    parser.add_argument(
         "--ple-backend",
         default=ServerArgs.ple_backend,
         choices=["pinned", "disk"],

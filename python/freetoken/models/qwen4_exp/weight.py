@@ -283,7 +283,9 @@ class PleTable:
 
 # The table's storage dtype per release: fp8 codes with a scalar scale in the quantized
 # checkpoints, plain bf16 in ``Qwen/Qwen3.8-Flash-Next`` (128 shards, 102.4 GB, no scale).
-_PLE_ST_DTYPES = {"F8_E4M3": torch.float8_e4m3fn, "BF16": torch.bfloat16}
+# ``_PLE_ST_DTYPE`` keeps its name and meaning -- the fp8 one -- because ple_disk imports it.
+_PLE_ST_DTYPE = "F8_E4M3"
+_PLE_ST_DTYPES = {_PLE_ST_DTYPE: torch.float8_e4m3fn, "BF16": torch.bfloat16}
 
 
 def _safetensors_header(path: str) -> tuple[dict, int]:

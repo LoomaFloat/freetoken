@@ -320,3 +320,76 @@ def test_a_mixed_dtype_table_is_refused(tmp_path):
 
     with pytest.raises(ValueError, match="mixes dtypes"):
         load_ple_table(path, PLE_ARGS, pin=False)
+
+
+# ------------------------------------------------------------------ дисковая таблица
+#
+# `--ple-backend disk` — УМОЛЧАНИЕ движка (engine/config.py), а не опция для
+# экономии памяти, так что именно этот путь и идёт на узле. Стенд 2026-09-26:
+# переименование `_PLE_ST_DTYPE` уронило задачу импортом из ple_disk уже после
+# того, как веса скачались.
+
+
+def test_every_module_of_the_family_imports():
+    """Ловушка на переименование приватного имени, которое импортирует сосед.
+
+    Тесты читалки её не ловят: они `ple_disk` не трогают, а на узле его тянет
+    `load_host_tables` всегда. Дешевле перебрать пакет целиком."""
+    import importlib, pkgutil
+
+    import freetoken.models.qwen4_exp as family
+
+    failed = {}
+    for mod in pkgutil.iter_modules(family.__path__):
+        try:
+            importlib.import_module(f"{family.__name__}.{mod.name}")
+        except ImportError as exc:            # отсутствующая cuda-зависимость — не наша беда
+            if "freetoken" in str(exc):
+                failed[mod.name] = str(exc)
+    assert not failed, failed
+
+
+def _disk_source(path: str):
+    from freetoken.models.qwen4_exp.ple_disk import source_from_safetensors
+
+    return source_from_safetensors(path)
+
+
+def test_the_disk_source_reads_a_bf16_table(tmp_path):
+    path, _raw = _table_checkpoint(tmp_path, fp8=False)
+
+    source = _disk_source(path)
+
+    assert source.dtype is torch.bfloat16
+    assert source.total_rows == NGRAM_SHARDS * NGRAM_ROWS
+    assert source.scale == 1.0
+
+
+def test_the_disk_row_is_measured_in_bytes(tmp_path):
+    """Store адресует строки байтовым шагом. Для fp8 байты и столбцы
+    совпадали, для bf16 нет — и строка читалась бы наполовину."""
+    path, _raw = _table_checkpoint(tmp_path, fp8=False)
+
+    source = _disk_source(path)
+
+    assert source.row_bytes == NGRAM_DIM * 2
+    assert source.row_stride == source.row_bytes
+
+
+def test_the_fp8_disk_source_is_unchanged(tmp_path):
+    path, _raw = _table_checkpoint(tmp_path, fp8=True)
+
+    source = _disk_source(path)
+
+    assert source.dtype is torch.float8_e4m3fn
+    assert source.row_bytes == NGRAM_DIM
+    assert source.scale == 0.125
+
+
+def test_the_fp8_disk_source_still_needs_its_scale(tmp_path):
+    path, raw = _table_checkpoint(tmp_path, fp8=True)
+    del raw[f"{PLE}.weight_scale"]
+    save_file(raw, str(tmp_path / "model-ple-00000.safetensors"))
+
+    with pytest.raises(ValueError, match="no weight_scale"):
+        _disk_source(path)

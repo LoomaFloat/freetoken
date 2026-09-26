@@ -22,7 +22,7 @@ from freetoken.utils import init_logger
 from .weight import (
     _PLE_SCALE_SUFFIX,
     _PLE_SHARD_RE,
-    _PLE_ST_DTYPE,
+    _PLE_ST_DTYPES,
     _ple_table_files,
     _safetensors_header,
 )
@@ -50,6 +50,11 @@ class PleRowSource:
     row_bytes: int
     row_stride: int
     scale: float
+    #: Как значения лежат на диске. Store читает БАЙТЫ и dtype не знает, а
+    #: `lookup` по нему толкует прочитанное: fp8-коды надо разжать умножением
+    #: на `scale`, bf16 уже готов. Для fp8 это float8_e4m3fn, для
+    #: неквантованного релиза -- bfloat16.
+    dtype: torch.dtype = torch.float8_e4m3fn
 
     @property
     def total_rows(self) -> int:
@@ -59,6 +64,7 @@ class PleRowSource:
 def source_from_safetensors(folder: str) -> PleRowSource:
     """Map the checkpoint's ``ngram_embedding.shard_<i>`` tensors in place: one extent per shard, no copy."""
     rows = cols = 0
+    dtype: torch.dtype | None = None
     scale: torch.Tensor | None = None
     paths: list[str] = []
     path_idx: dict[str, int] = {}
@@ -75,8 +81,12 @@ def source_from_safetensors(folder: str) -> PleRowSource:
             match = _PLE_SHARD_RE.search(key)
             if match is None:
                 continue
-            if meta["dtype"] != _PLE_ST_DTYPE:
-                raise ValueError(f"PLE shard {key} has dtype {meta['dtype']}, expected {_PLE_ST_DTYPE}")
+            stored = _PLE_ST_DTYPES.get(meta["dtype"])
+            if stored is None:
+                raise ValueError(f"PLE shard {key} has unsupported dtype {meta['dtype']}")
+            if dtype is not None and stored is not dtype:
+                raise ValueError(f"PLE table mixes dtypes: {key} is {meta['dtype']}, expected {dtype}")
+            dtype = stored
             if rows and tuple(meta["shape"]) != (rows, cols):
                 raise ValueError(f"PLE shard {key} is {meta['shape']}, expected {[rows, cols]}")
             rows, cols = meta["shape"]
@@ -90,9 +100,17 @@ def source_from_safetensors(folder: str) -> PleRowSource:
     if sorted(shards) != list(range(len(shards))) or not shards:
         raise ValueError(f"PLE shard indices are not contiguous 0..N-1: {sorted(shards)[:8]}")
     if scale is None:
-        raise ValueError("PLE table has no weight_scale")
+        # Коды без своей шкалы бесполезны; bf16-таблица хранит значения и
+        # шкалы не везёт вовсе, там единица -- верный множитель, а не заглушка.
+        if dtype is not torch.bfloat16:
+            raise ValueError("PLE table has no weight_scale")
+        scale = torch.ones(())
     order = [shards[i] for i in range(len(shards))]
-    return PleRowSource(paths, [f for f, _ in order], [b for _, b in order], rows, cols, cols, float(scale))
+    # В БАЙТАХ, а не в элементах: у fp8 они совпадали, у bf16 нет. Store
+    # адресует строки байтовым шагом, и ошибка здесь читает половину строки.
+    row_bytes = cols * torch.empty((), dtype=dtype).element_size()
+    return PleRowSource(paths, [f for f, _ in order], [b for _, b in order], rows,
+                        row_bytes, row_bytes, float(scale), dtype)
 
 
 def resolve_row_source(folder: str) -> PleRowSource:
@@ -115,7 +133,11 @@ class DiskRowTable:
         from freetoken.kernel import _ple_store
 
         self.num_rows = source.total_rows
-        self.head_dim = source.row_bytes  # fp8: one byte per element
+        self.stored = source.dtype
+        # Столбцов в строке, а не байт: у fp8 это одно и то же, у bf16 вдвое
+        # меньше байтов. `_token_bytes` ниже считается от row_bytes и остаётся
+        # байтовым -- через него адресуется staging.
+        self.head_dim = source.row_bytes // torch.empty((), dtype=source.dtype).element_size()
         self.dtype = dtype
         self.heads = int(hash_constants["num_ngram_heads"])
         self.scale = source.scale
@@ -142,7 +164,7 @@ class DiskRowTable:
             use_io_uring=os.getenv(_IO_URING_ENV, "1") != "0",
         )
         self._device = torch.device("cuda", torch.cuda.current_device())
-        self._token_bytes = self.heads * self.head_dim
+        self._token_bytes = self.heads * source.row_bytes
         # allocated up front: pinned alloc inside stream capture is illegal; one replay consumes it at a time
         self._graph_pinned = alloc_pinned_tensor(max_graph_rows * self._token_bytes, dtype=torch.uint8)
         self._graph_pinned.zero_()  # padded decode lanes read whatever sits here
@@ -270,7 +292,8 @@ class DiskRowTable:
         )
         nbytes = rows * self._token_bytes
         dev[:nbytes].copy_(pinned[:nbytes], non_blocking=True)
-        values = dev[:nbytes].view(torch.float8_e4m3fn).to(self.dtype)
+        # `.to` -- пустая операция, когда на диске уже bf16.
+        values = dev[:nbytes].view(self.stored).to(self.dtype)
         if self.scale != 1.0:
             values = values * self.scale
         values = values.view(*row_ids.shape[:-1], -1)

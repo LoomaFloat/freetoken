@@ -339,6 +339,14 @@ class ModelConfig:
     qwen4_args: Any | None = None
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
+    #: Слои, которые строит ЭТА стадия: полуинтервал ``[первый, за последним)``.
+    #: ``None`` — вся модель, и тогда всё ниже ведёт себя ровно как раньше.
+    #:
+    #: Номера слоёв остаются ГЛОБАЛЬНЫМИ. От них зависят `layer_types`,
+    #: `ple_layer_ids` и принадлежность к группе внимания; перенумеровав их
+    #: под стадию, пришлось бы переписывать конфиг модели на каждую стадию, и
+    #: слой 24 стал бы линейным вместо полного.
+    layer_range: Tuple[int, int] | None = None
     single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1
     # Extra per-request tensors riding the LinearStatePool slots (see SlotStateSpec);
     # () for models without any. Requires a linear-attention group to ride on.
@@ -349,13 +357,32 @@ class ModelConfig:
         return "moe" in self.model_type or self.moe_enabled
 
     @property
-    def num_moe_layers(self) -> int:
-        """Number of layers that own a sparse MoE block (and offload-cache expert slots).
+    def local_layer_ids(self) -> Tuple[int, ...]:
+        """Глобальные номера слоёв, которые строит эта стадия."""
+        first, last = self.layer_range or (0, self.num_layers)
+        return tuple(range(first, last))
 
-        Models with leading dense layers (``first_k_dense_replace`` > 0, e.g. GLM-4)
-        only store experts for the trailing layers; everything else has all layers MoE.
+    @property
+    def owns_first_layer(self) -> bool:
+        """Строит ли эта стадия эмбеддинги входа."""
+        return self.layer_range is None or self.layer_range[0] <= 0
+
+    @property
+    def owns_last_layer(self) -> bool:
+        """Строит ли эта стадия голову: финальный смеситель и lm_head."""
+        return self.layer_range is None or self.layer_range[1] >= self.num_layers
+
+    @property
+    def num_moe_layers(self) -> int:
+        """Сколько слоёв с разреженным MoE держит ЭТА стадия.
+
+        Отсюда берётся число банков экспертов, а значит и память хоста под
+        пул. Для целой модели это как раньше: всё, кроме ведущих плотных слоёв
+        (``first_k_dense_replace`` > 0 у GLM-4). Для стадии конвейера — только
+        её слои, и в этом весь смысл: пул делится между хостами.
         """
-        return self.num_layers - self.first_k_dense_replace
+        return sum(1 for layer_id in self.local_layer_ids
+                   if layer_id >= self.first_k_dense_replace)
 
     @property
     def is_multimodal(self) -> bool:

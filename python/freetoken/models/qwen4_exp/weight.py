@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Iterator
 
 import safetensors
 import torch
-from freetoken.distributed import get_tp_info
+from freetoken.distributed import get_stage_info, get_tp_info
 from freetoken.models.qwen3_vl.weight import rename_vl_prefix
 
 from freetoken.models.config import VISION_KEY_PREFIXES
@@ -109,6 +109,56 @@ def _rename(raw_name: str) -> str | None:
     if raw_name.endswith(_SCALE_SUFFIXES):
         return None
     return rename_vl_prefix(raw_name)
+
+
+#: Номер слоя в УЖЕ переименованном ключе (`model.layers.7.…`).
+_RENAMED_LAYER_RE = re.compile(r"(?P<head>(?:^|\.)layers\.)(?P<id>\d+)\.")
+
+
+def _stage_keeps(total_layers: int):
+    """Фильтр «это моё» по переименованным ключам; None — стадия одна.
+
+    Края достаются краям: эмбеддинги первой стадии, смеситель и `lm_head`
+    последней. Башня зрения идёт с эмбеддингами — она их и кормит; на
+    непервой стадии её вес отбрасывается, и если движок её всё-таки построил,
+    `load_state_dict` скажет об этом вслух, а не соберёт молча полумодель.
+    """
+    stage = get_stage_info(total_layers)
+    if stage.whole:
+        return None
+
+    def keep(name: str) -> bool:
+        match = _RENAMED_LAYER_RE.search(name)
+        if match is not None:
+            return stage.owns(int(match["id"]))
+        if name.startswith(VISION_KEY_PREFIXES) or name.startswith("model.embed_tokens"):
+            return stage.is_first
+        if name.startswith("lm_head") or name.startswith("model.hyper_connection_mixer"):
+            return stage.is_last
+        return True
+
+    return keep
+
+
+def _stage_renumber(total_layers: int):
+    """Глобальный номер слоя -> номер внутри стадии; None — стадия одна.
+
+    Стадия держит свои слои подряд с нуля: ``OPList`` нумерует их по порядку,
+    и у стадии со слоями 2..3 в state dict лежат ``layers.0`` и ``layers.1``.
+    А вот квантовые схемы ищутся по номеру ИЗ ЧЕКПОИНТА (у смешанной точности
+    они заданы послойно), поэтому переименование идёт в самом конце — после
+    того, как проекции слиты и схема уже спрошена.
+    """
+    stage = get_stage_info(total_layers)
+    if stage.whole:
+        return None
+
+    def local(name: str) -> str:
+        return _RENAMED_LAYER_RE.sub(
+            lambda m: f"{m['head']}{int(m['id']) - stage.first}.", name, count=1
+        )
+
+    return local
 
 
 def _split_kind(name: str) -> tuple[str, str]:
@@ -224,6 +274,9 @@ def iter_weights(
 
     hf_config = cached_load_hf_config(model_path)
     spec = get_model_spec(hf_config.architectures[0])
+    text = getattr(hf_config, "text_config", hf_config)
+    mine = _stage_keeps(int(text.num_hidden_layers))
+    local = _stage_renumber(int(text.num_hidden_layers))
     fuser = _DenseFuser(get_quant_config(), spec.packed_modules_mapping)
     for file in tqdm(
         iter_weight_files(model_path),
@@ -237,13 +290,15 @@ def iter_weights(
                     continue
                 if not include_vision and name.startswith(VISION_KEY_PREFIXES):
                     continue
+                if mine is not None and not mine(name):
+                    continue
                 tensor = f.get_tensor(raw_name)
                 fused = fuser.fuse(name, tensor)
                 if fused is None:
                     fuser.check_unfused(name, tensor)
-                    yield name, tensor
-                else:
-                    yield from fused
+                    fused = [(name, tensor)]
+                for merged, value in fused:
+                    yield (merged if local is None else local(merged)), value
 
     assert not fuser.buf, f"Incomplete projection fusions: {sorted(k[0] + k[1] for k in fuser.buf)}"
 
@@ -447,23 +502,30 @@ def _stacked_bf16_pieces(model_path: str, config) -> Iterator["Piece"]:
     """
     from freetoken.models.loader import safetensors_weight_map
 
+    from freetoken.moe.expert_pieces import bank_layer_of
+
     experts = int(config.num_experts)
     hidden = int(config.hidden_size)
     intermediate = int(config.moe_intermediate_size)
-    layers = int(config.num_moe_layers)
-    dense = int(config.num_layers) - layers
+    dense = int(getattr(config, "first_k_dense_replace", 0) or 0)
+    # Слои ЭТОЙ стадии, а не `range(num_moe_layers)`: у стадии конвейера банк
+    # с индексом 0 — это глобальный слой 24, и брать чекпоинтные имена по
+    # локальному счёту значит прочитать чужую половину модели.
+    mine = [layer for layer in config.local_layer_ids if layer >= dense]
     shapes = {"gate_up": (experts, 2 * intermediate, hidden), "down": (experts, hidden, intermediate)}
 
     folder = download_hf_weight(model_path)
     weight_map = safetensors_weight_map(folder)
 
-    for bank_layer in tqdm(
-        range(layers), desc="Loading bf16 experts", disable=not get_tp_info().is_primary()
+    for layer in tqdm(
+        mine, desc="Loading bf16 experts", disable=not get_tp_info().is_primary()
     ):
+        bank_layer = bank_layer_of(config, layer)
+        assert bank_layer is not None, layer
         piece: dict[str, torch.Tensor] = {}
         paths: list[str] = []
         for role, leaf in (("gate_up", "gate_up_proj"), ("down", "down_proj")):
-            name = _STACKED_EXPERT_KEY.format(layer=dense + bank_layer, leaf=leaf)
+            name = _STACKED_EXPERT_KEY.format(layer=layer, leaf=leaf)
             shard = weight_map.get(name)
             if shard is None:
                 raise ValueError(f"checkpoint has no stacked routed experts at {name}")

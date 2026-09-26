@@ -89,17 +89,28 @@ class Qwen4ExpDecoderLayer(BaseOP):
 class Qwen4ExpModel(BaseOP):
     def __init__(self, config: ModelConfig, *, prefix: str = "model") -> None:
         self.hc_count = config.qwen4_args.hc_count
-        self.embed_tokens = VocabParallelEmbedding(
-            num_embeddings=config.vocab_size,
-            embedding_dim=config.hidden_size,
+        # Стадия конвейера строит только свои слои, а края — только те, кому
+        # они достались: эмбеддинги у первой, смеситель и lm_head у последней.
+        # Без диапазона всё это True, и модель собирается ровно как раньше.
+        self.embed_tokens = (
+            VocabParallelEmbedding(
+                num_embeddings=config.vocab_size,
+                embedding_dim=config.hidden_size,
+            )
+            if config.owns_first_layer
+            else None
         )
         self.layers = OPList(
             [
                 Qwen4ExpDecoderLayer(config, layer_id, prefix=f"{prefix}.layers.{layer_id}")
-                for layer_id in range(config.num_layers)
+                for layer_id in config.local_layer_ids
             ]
         )
-        self.hyper_connection_mixer = GatedResidual(config, use_combine=False, prefix=f"{prefix}.hyper_connection_mixer")
+        self.hyper_connection_mixer = (
+            GatedResidual(config, use_combine=False, prefix=f"{prefix}.hyper_connection_mixer")
+            if config.owns_last_layer
+            else None
+        )
         # plain tuple (not an OP child), so it never shows up in the state dict
         self._ple = tuple(layer.ple for layer in self.layers.op_list if layer.ple is not None)
 
@@ -108,9 +119,17 @@ class Qwen4ExpModel(BaseOP):
         """The PLE layers in decoder order -- the seam the loader attaches table backends to."""
         return list(self._ple)
 
-    def forward(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
-        hidden = embed_input_ids(self.embed_tokens, input_ids, batch)
-        hidden = hidden.repeat(1, self.hc_count)
+    def forward(self, input_ids: torch.Tensor, batch: Batch,
+                hidden: torch.Tensor | None = None) -> torch.Tensor:
+        """Свои слои. ``hidden`` — остаток от предыдущей стадии.
+
+        Остаток ``R [T, hc_count*hidden]`` — единственное, что пересекает
+        границу стадии: между слоями больше не ездит ничего. Не-последняя
+        стадия и отдаёт его как есть, не собирая потоки смесителем.
+        """
+        if hidden is None:
+            hidden = embed_input_ids(self.embed_tokens, input_ids, batch)
+            hidden = hidden.repeat(1, self.hc_count)
         meta = None
         if self._ple:
             from .ple import build_ple_metadata, commit_ngram_context
@@ -124,6 +143,8 @@ class Qwen4ExpModel(BaseOP):
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
+        if self.hyper_connection_mixer is None:
+            return hidden
         return self.hyper_connection_mixer.mix(hidden)[0]
 
 
@@ -131,13 +152,17 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig) -> None:
         self._config = config
         self.model = Qwen4ExpModel(config)
-        self.lm_head = ParallelLMHead(
-            num_embeddings=config.vocab_size,
-            embedding_dim=config.hidden_size,
-            tie_word_embeddings=config.tie_word_embeddings,
-            tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
-            quant_config=config.quant,
-            prefix="lm_head",
+        self.lm_head = (
+            ParallelLMHead(
+                num_embeddings=config.vocab_size,
+                embedding_dim=config.hidden_size,
+                tie_word_embeddings=config.tie_word_embeddings,
+                tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
+                quant_config=config.quant,
+                prefix="lm_head",
+            )
+            if config.owns_last_layer
+            else None
         )
         super().__init__()
 
@@ -210,7 +235,12 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch
-        return self.lm_head.forward(self.model.forward(batch.input_ids, batch))
+        hidden = self.model.forward(batch.input_ids, batch)
+        if self.lm_head is None:
+            # Промежуточная стадия логитов не считает: её выход — остаток, и
+            # везти его дальше должен тот, кто вызывает (шов, фаза 2).
+            return hidden
+        return self.lm_head.forward(hidden)
 
 
 class Qwen4ExpForConditionalGeneration(QwenVLVisionMixin, Qwen4ExpForCausalLM):

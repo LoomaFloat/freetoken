@@ -25,9 +25,22 @@ def num_moe_layers(config) -> int:
 
 
 def bank_layer_of(config, layer: int) -> int | None:
-    """MoE-layer index of checkpoint layer ``layer``; None for the leading dense layers."""
-    bank_layer = layer - int(getattr(config, "first_k_dense_replace", 0) or 0)
-    return bank_layer if 0 <= bank_layer < num_moe_layers(config) else None
+    """Индекс банка экспертов для checkpoint-слоя ``layer``; None — не наш.
+
+    Не просто «минус ведущие плотные»: стадия конвейера держит банки только
+    своих слоёв, и глобальный слой 24 у неё нулевой. Когда диапазона нет
+    (``local_layer_ids`` покрывает всю модель), возвращается ровно то же, что
+    и раньше.
+    """
+    dense = int(getattr(config, "first_k_dense_replace", 0) or 0)
+    if layer < dense:
+        return None
+    local = getattr(config, "local_layer_ids", None)
+    if local is None:
+        bank_layer = layer - dense
+        return bank_layer if 0 <= bank_layer < num_moe_layers(config) else None
+    mine = [layer_id for layer_id in local if layer_id >= dense]
+    return mine.index(layer) if layer in mine else None
 
 
 def _model_hook(spec, name: str):

@@ -6,7 +6,7 @@ from functools import cached_property
 from typing import TYPE_CHECKING, List
 
 import torch
-from freetoken.distributed import DistributedInfo
+from freetoken.distributed import DistributedInfo, set_stage_info
 from freetoken.layers.quantization import set_quant_config
 from freetoken.mm.config import ENCODER_SECTIONS, MultimodalConfig
 from freetoken.models.register import EncoderSpec, ModelSpec, _load_attr, checkpoint_quant_config, get_model_spec
@@ -32,6 +32,10 @@ class EngineConfig:
     quant_backend: str | None = None
     # PLE table backend: "disk" (default) reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM.
     ple_backend: str = "disk"
+    #: Отрезок слоёв этого процесса, ``"первый:за последним"`` — стадия
+    #: конвейера. Пусто — вся модель. Делится ради ПАМЯТИ ХОСТА: пул
+    #: экспертов живёт в ней, и на одном хосте он целиком не помещается.
+    layer_range: str = ""
     # Expert-bank host load (--expert-load): auto|serial|parallel. "auto" reads scattered
     # experts in parallel but falls back to serial when free RAM can't cover the banks + the
     # parallel reader's extra (non-reclaimable) whole-shard buffer; "serial" forces the
@@ -136,7 +140,8 @@ class EngineConfig:
         quant = checkpoint_quant_config(self.model_path, hf_config, spec)
         set_quant_config(quant)
         model_config = _load_attr(spec.module, spec.parse_config)(hf_config)
-        return replace(model_config, quant=quant)
+        model_config = replace(model_config, quant=quant)
+        return _stage_view(model_config, self.layer_range)
 
     @property
     def max_seq_len(self) -> int:
@@ -151,3 +156,44 @@ class EngineConfig:
     @property
     def distributed_addr(self) -> str:
         return "tcp://127.0.0.1:2333"
+
+
+def _parse_layer_range(text: str, num_layers: int) -> tuple[int, int]:
+    """``"0:24"`` -> ``(0, 24)``. Отказ внятный: ошибка тут — это полмодели молча."""
+    head, _, tail = text.partition(":")
+    if not _:
+        raise ValueError(f"--layer-range ждёт 'первый:за последним', получено {text!r}")
+    try:
+        first, last = int(head), int(tail)
+    except ValueError:
+        raise ValueError(f"--layer-range ждёт числа, получено {text!r}") from None
+    if not 0 <= first < last <= num_layers:
+        raise ValueError(
+            f"--layer-range {text!r} не укладывается в модель из {num_layers} слоёв"
+        )
+    return first, last
+
+
+def _stage_view(config: "ModelConfig", text: str) -> "ModelConfig":
+    """Конфиг глазами одной стадии: её слои, её KV, её банки экспертов.
+
+    Номера слоёв остаются глобальными — от них зависят типы слоёв и
+    `ple_layer_ids`. Меняется состав: группы внимания и слотовые состояния
+    сужаются до своих слоёв, и KV-кэш считается уже по ним.
+    """
+    if not text:
+        return config
+    first, last = _parse_layer_range(text, config.num_layers)
+    set_stage_info(first, last, config.num_layers)
+    mine = range(first, last)
+    groups = tuple(
+        replace(group, layer_ids=tuple(i for i in group.layer_ids if i in mine))
+        for group in config.attention_groups
+    )
+    slots = tuple(
+        replace(spec, layer_ids=tuple(i for i in spec.layer_ids if i in mine))
+        if spec.layer_ids else spec
+        for spec in config.slot_states
+    )
+    logger.info("стадия держит слои %d..%d из %d", first, last - 1, config.num_layers)
+    return replace(config, layer_range=(first, last), attention_groups=groups, slot_states=slots)

@@ -616,6 +616,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--layer-range",
+        default=ServerArgs.layer_range,
+        help=(
+            "Layers this process holds, 'first:past-last' (e.g. '0:24'). Empty = the whole "
+            "model. A pipeline stage: the expert pool lives in host RAM, so splitting layers "
+            "across hosts is what splits the pool."
+        ),
+    )
+
+    parser.add_argument(
         "--ple-backend",
         default=ServerArgs.ple_backend,
         choices=["pinned", "disk"],

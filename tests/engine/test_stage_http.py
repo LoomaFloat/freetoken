@@ -166,6 +166,48 @@ def test_a_full_step_round_trip(pair):
     assert head._step == 2 and tail._step == 2
 
 
+def test_the_seam_times_itself(pair, caplog):
+    """Секундомер шва: отдача и ожидание считаются, отчёт печатается и обнуляет счёт.
+
+    Нужен он затем, что на стенде 3 ток/с, и делить 333 мс между сетью, PCIe и
+    eager-запусками на глаз не выходит — оценка уже разошлась с замером.
+    """
+    import logging
+
+    head, tail, relay = pair
+    batch = SimpleNamespace()
+
+    # Частота по умолчанию, чтобы отчёт не обнулил счёт раньше, чем мы посмотрим.
+    remainder = torch.zeros((1, 10240), dtype=torch.bfloat16)
+    head.give(batch, remainder)
+    tail.take(batch)
+    tail.publish(batch, torch.tensor([1], dtype=torch.int32))
+    head.tokens(batch)
+
+    assert head._spent["отдача"] > 0, "отдача остатка не посчиталась"
+    assert tail._spent["ожидание"] > 0, "ожидание остатка не посчиталось"
+
+    head._report_every = 1
+    with caplog.at_level(logging.INFO):
+        head._report()
+    assert any("шов за" in record.message for record in caplog.records)
+    assert head._spent == {"отдача": 0.0, "ожидание": 0.0}, "отчёт не обнулил счёт"
+
+
+def test_the_seam_stopwatch_can_be_silenced(pair):
+    """Нулевая частота — молчать: отчёт не должен становиться обязательным."""
+    head, tail, relay = pair
+    batch = SimpleNamespace()
+    head._report_every = 0
+
+    head.give(batch, torch.zeros((1, 10240), dtype=torch.bfloat16))
+    tail.take(batch)
+    tail.publish(batch, torch.tensor([1], dtype=torch.int32))
+    head.tokens(batch)
+
+    assert head._counted == 0 and head._spent["отдача"] > 0
+
+
 def test_a_message_from_the_wrong_step_is_refused(pair):
     """Разойдясь на шаг, стадии считали бы разные токены и не заметили."""
     head, tail, _relay = pair

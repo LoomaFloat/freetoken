@@ -36,6 +36,8 @@ from .stage import StageLink
 #: Печатать каждый шаг бессмысленно: на 3 ток/с это три строки в секунду шума,
 #: а нужен порядок величины, а не отдельный токен.
 _REPORT_EVERY = int(os.environ.get("FREETOKEN_STAGE_REPORT_EVERY", "16") or 0)
+#: Из чего складывается шаг стадии; смысл каждой — в `HttpStageLink._report`.
+BUCKETS = ("счёт", "выгрузка", "сеть", "ожидание")
 
 logger = init_logger(__name__)
 
@@ -114,13 +116,16 @@ class HttpStageLink(StageLink):
         # на первой же стадии, которая не публикует.
         self._step = 0
         self._inbox: Dict[str, queue.Queue] = {REMAINDER: queue.Queue(), TOKENS: queue.Queue()}
-        # Секундомер шва. Стенд 2026-09-27: 3 ток/с, и оценить на глаз, сколько
-        # из 333 мс уходит в сеть, а сколько в PCIe и в eager-запуски, нельзя —
-        # оценка уже разошлась с замером. `отдача` это чистая сеть (отправка и
-        # подтверждение), `ожидание` — сеть ПЛЮС то, что сосед за это время
-        # считал, так что вычитать одно из другого нельзя.
-        self._spent: Dict[str, float] = {"отдача": 0.0, "ожидание": 0.0}
+        # Секундомер шага (см. `_step_done`). Текущий шаг копится отдельно и
+        # попадает в среднее, только если это был шаг ДЕКОДА: префилл и
+        # простой между запросами исказили бы число в разы.
+        self._now_spent: Dict[str, float] = dict.fromkeys(BUCKETS, 0.0)
+        self._spent: Dict[str, float] = dict.fromkeys(BUCKETS, 0.0)
+        self._period = 0.0
         self._counted = 0
+        self._input_at: float | None = None
+        self._ended_at: float | None = None
+        self._prefill = False
         self._report_every = _REPORT_EVERY
         self._server = self._listen(listen_port)
 
@@ -162,13 +167,27 @@ class HttpStageLink(StageLink):
             raise StageProtocolError(
                 f"{kind} пришёл с шага {step}, а эта стадия на {self._step}: стадии разошлись"
             )
-        self._spent["ожидание"] += time.perf_counter() - started
-        return unpack(body, shape, dtype, device=self.device)
+        self._input_at = time.perf_counter()
+        self._now_spent["ожидание"] += self._input_at - started
+        got = unpack(body, shape, dtype, device=self.device)
+        if kind == REMAINDER and got.dim() and got.shape[0] > 1:
+            self._prefill = True
+        return got
 
     # ------------------------------------------------------------ отправка
     def _post(self, kind: str, tensor: torch.Tensor, to: str) -> None:
         started = time.perf_counter()
+        if self._input_at is not None:
+            self._now_spent["счёт"] += started - self._input_at
+            self._input_at = None
+        if kind == REMAINDER and tensor.dim() and tensor.shape[0] > 1:
+            self._prefill = True
+        # `pack` снимает тензор с карты синхронной копией, то есть ЖДЁТ всю
+        # недосчитанную работу GPU этой стадии. Это счёт, а не сеть: первая
+        # версия секундомера записывала его в сеть и путала одно с другим.
         body, shape, dtype = pack(tensor)
+        packed = time.perf_counter()
+        self._now_spent["выгрузка"] += packed - started
         parts = urllib.parse.urlsplit(self.send_url)
         connection = http.client.HTTPConnection(parts.netloc, timeout=self.timeout_s)
         try:
@@ -184,7 +203,7 @@ class HttpStageLink(StageLink):
                 raise StageProtocolError(f"посредник отказал на {kind}: HTTP {answer.status}")
         finally:
             connection.close()
-            self._spent["отдача"] += time.perf_counter() - started
+            self._now_spent["сеть"] += time.perf_counter() - packed
 
     # ------------------------------------------------------------ StageLink
     def take(self, batch: Batch) -> torch.Tensor:
@@ -196,7 +215,7 @@ class HttpStageLink(StageLink):
     def tokens(self, batch: Batch) -> torch.Tensor:
         got = self._await(TOKENS)
         self._step += 1      # шаг этой стадии закончился
-        self._report()
+        self._step_done()
         return got
 
     def publish(self, batch: Batch, tokens: torch.Tensor) -> None:
@@ -204,26 +223,55 @@ class HttpStageLink(StageLink):
         # не узнав его, любая стадия разойдётся с остальными.
         self._post(TOKENS, tokens, to="*")
         self._step += 1      # шаг этой стадии закончился
-        self._report()
+        self._step_done()
+
+    def _step_done(self) -> None:
+        """Сложить шаг в среднее — если это был шаг декода.
+
+        Префилл везёт через шов `[T, ширина]` с T > 1 и идёт в разы дольше, а
+        шаг после простоя между запросами несёт в периоде сам простой. Оба
+        сдвинули бы среднее, и всё, что с T > 1, в него не попадает.
+        """
+        now = time.perf_counter()
+        period = None if self._ended_at is None else now - self._ended_at
+        self._ended_at = now
+        spent, self._now_spent = self._now_spent, dict.fromkeys(BUCKETS, 0.0)
+        prefill, self._prefill = self._prefill, False
+        if prefill or period is None or not self._report_every:
+            return
+        for name, value in spent.items():
+            self._spent[name] += value
+        self._period += period
+        self._counted += 1
+        if self._counted >= self._report_every:
+            self._report()
 
     def _report(self) -> None:
-        """Средние времена шва за последние `_report_every` шагов.
+        """Средний шаг декода этой стадии и из чего он сложен.
 
-        Считается тут, а не в движке, потому что только здесь видно обе
-        стороны обмена. `отдача` — чистая сеть; `ожидание` включает счёт
-        соседа, и разница между ними это НЕ задержка сети.
+        - `счёт` — от момента, когда вход стадии на руках, до отправки выхода:
+          своя работа стадии на хосте, с планировщиком;
+        - `выгрузка` — снятие выхода с карты. Ждёт всю недосчитанную работу
+          GPU этой стадии, так что это тоже счёт, только асинхронный;
+        - `сеть` — от готовых байтов до подтверждения посредника;
+        - `ожидание` — пока сосед пришлёт своё: сеть в пути плюс его счёт;
+        - `вне шва` — остаток периода. У головы ≈ 0; у хвоста это работа
+          после отправки токена, которая идёт параллельно с головой.
+
+        У головы `шаг = счёт + выгрузка + сеть + ожидание`, и это время токена.
         """
-        if not self._report_every:
-            return
-        self._counted += 1
-        if self._counted < self._report_every:
-            return
-        per_step = {name: 1e3 * total / self._counted for name, total in self._spent.items()}
+        n = self._counted
+        ms = {name: 1e3 * total / n for name, total in self._spent.items()}
+        period = 1e3 * self._period / n
         logger.info(
-            "шов за %d шагов, мс на шаг: %s", self._counted,
-            ", ".join(f"{name} {value:.1f}" for name, value in per_step.items()),
+            "шов за %d шагов декода, мс на шаг: шаг %.1f (%.2f ток/с) = "
+            "счёт %.1f + выгрузка %.1f + сеть %.1f + ожидание %.1f + вне шва %.1f",
+            n, period, 1e3 / period if period else 0.0,
+            ms["счёт"], ms["выгрузка"], ms["сеть"], ms["ожидание"],
+            period - sum(ms.values()),
         )
         self._counted = 0
+        self._period = 0.0
         for name in self._spent:
             self._spent[name] = 0.0
 

@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 
@@ -166,46 +167,121 @@ def test_a_full_step_round_trip(pair):
     assert head._step == 2 and tail._step == 2
 
 
-def test_the_seam_times_itself(pair, caplog):
-    """Секундомер шва: отдача и ожидание считаются, отчёт печатается и обнуляет счёт.
+def _step(head, tail, rows: int = 1, *, busy_s: float = 0.0) -> None:
+    """Один шаг конвейера в одном потоке: остаток вперёд, токен назад."""
+    batch = SimpleNamespace()
+    head.give(batch, torch.zeros((rows, 10240), dtype=torch.bfloat16))
+    tail.take(batch)
+    if busy_s:
+        time.sleep(busy_s)
+    tail.publish(batch, torch.tensor([1], dtype=torch.int32))
+    head.tokens(batch)
 
-    Нужен он затем, что на стенде 3 ток/с, и делить 333 мс между сетью, PCIe и
-    eager-запусками на глаз не выходит — оценка уже разошлась с замером.
+
+def test_the_seam_reports_the_step_and_the_rate(pair, caplog):
+    """Отчёт печатается раз в N шагов декода, называет ток/с и обнуляет счёт.
+
+    Стенд 2026-09-27: 3 ток/с, а по первой версии секундомера делить 333 мс
+    между сетью и счётом не выходило — она не мерила ни период шага, ни счёт.
     """
     import logging
 
     head, tail, relay = pair
-    batch = SimpleNamespace()
-
-    # Частота по умолчанию, чтобы отчёт не обнулил счёт раньше, чем мы посмотрим.
-    remainder = torch.zeros((1, 10240), dtype=torch.bfloat16)
-    head.give(batch, remainder)
-    tail.take(batch)
-    tail.publish(batch, torch.tensor([1], dtype=torch.int32))
-    head.tokens(batch)
-
-    assert head._spent["отдача"] > 0, "отдача остатка не посчиталась"
-    assert tail._spent["ожидание"] > 0, "ожидание остатка не посчиталось"
-
-    head._report_every = 1
+    head._report_every = tail._report_every = 2
     with caplog.at_level(logging.INFO):
-        head._report()
-    assert any("шов за" in record.message for record in caplog.records)
-    assert head._spent == {"отдача": 0.0, "ожидание": 0.0}, "отчёт не обнулил счёт"
+        for _ in range(3):          # первый шаг не в счёт: у него нет периода
+            _step(head, tail)
+    lines = [r.message for r in caplog.records if "шагов декода" in r.message]
+    assert len(lines) == 2, lines                   # по строке на стадию
+    assert all("ток/с" in line and "вне шва" in line for line in lines)
+    assert head._counted == 0 and head._period == 0.0
+    assert set(head._spent.values()) == {0.0}
+
+
+def test_unloading_from_the_card_is_not_the_network(pair, monkeypatch):
+    """Снятие выхода с карты — счёт стадии, а не сеть.
+
+    `pack` копирует с карты синхронно и потому ждёт всю недосчитанную работу
+    GPU. Первая версия секундомера писала это время в сеть, и на стенде
+    отправка токена хвостом (45.6 мс) выглядела медленнее отправки остатка
+    головой (2.3 мс) без всякой сетевой причины. Медленная карта здесь
+    изображена медленной упаковкой.
+    """
+    import freetoken.engine.stage_http as wire
+
+    real = wire.pack
+
+    def slow_pack(tensor):
+        time.sleep(0.2)
+        return real(tensor)
+
+    monkeypatch.setattr(wire, "pack", slow_pack)
+    head, tail, relay = pair
+    for _ in range(3):
+        _step(head, tail)
+
+    for stage in (head, tail):
+        assert stage._counted == 2
+        assert stage._spent["выгрузка"] / 2 >= 0.2, "ожидание карты не попало в выгрузку"
+        assert stage._spent["сеть"] / 2 < 0.1, "ожидание карты утекло в сеть"
+
+
+def test_the_head_step_is_the_sum_of_its_parts(pair):
+    """У головы `шаг = счёт + выгрузка + сеть + ожидание`, и счёт хвоста — в ожидании.
+
+    Хвост считает в своём потоке, как на стенде, и голова в это время
+    действительно ждёт. Если бы что-то выпадало из учёта, у головы появился
+    бы «вне шва» — остаток периода, которого не объясняет ни одна корзина.
+    """
+    head, tail, relay = pair
+    steps, busy = 5, 0.05
+
+    def tail_loop():
+        batch = SimpleNamespace()
+        for _ in range(steps):
+            tail.take(batch)
+            time.sleep(busy)                   # счёт хвоста
+            tail.publish(batch, torch.tensor([1], dtype=torch.int32))
+
+    worker = threading.Thread(target=tail_loop)
+    worker.start()
+    batch = SimpleNamespace()
+    for _ in range(steps):
+        head.give(batch, torch.zeros((1, 10240), dtype=torch.bfloat16))
+        head.tokens(batch)
+    worker.join(timeout=10)
+
+    n = head._counted
+    assert n == steps - 1
+    parts = sum(head._spent.values())
+    assert head._period - parts < 0.005 * n, "у головы часть шага не объяснена"
+    assert head._spent["ожидание"] / n >= busy, "счёт хвоста не виден в ожидании головы"
+    assert tail._spent["счёт"] / (tail._counted or 1) >= busy
+
+
+def test_prefill_does_not_enter_the_average(pair):
+    """Шаг, у которого через шов прошло больше одной строки, — префилл.
+
+    Он в разы дольше декода, а шаг после простоя несёт в периоде сам простой.
+    В среднее не попадает ни то, ни другое.
+    """
+    head, tail, relay = pair
+    _step(head, tail)                       # первый: без периода
+    _step(head, tail, rows=5, busy_s=0.3)   # префилл, и долгий
+    _step(head, tail)                       # декод
+
+    for stage in (head, tail):
+        assert stage._counted == 1
+        assert stage._period < 0.3, "время префилла попало в средний шаг"
 
 
 def test_the_seam_stopwatch_can_be_silenced(pair):
-    """Нулевая частота — молчать: отчёт не должен становиться обязательным."""
+    """Нулевая частота — молчать и ничего не копить."""
     head, tail, relay = pair
-    batch = SimpleNamespace()
-    head._report_every = 0
-
-    head.give(batch, torch.zeros((1, 10240), dtype=torch.bfloat16))
-    tail.take(batch)
-    tail.publish(batch, torch.tensor([1], dtype=torch.int32))
-    head.tokens(batch)
-
-    assert head._counted == 0 and head._spent["отдача"] > 0
+    head._report_every = tail._report_every = 0
+    for _ in range(3):
+        _step(head, tail)
+    assert head._counted == 0 and set(head._spent.values()) == {0.0}
 
 
 def test_a_message_from_the_wrong_step_is_refused(pair):

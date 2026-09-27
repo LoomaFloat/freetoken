@@ -251,11 +251,29 @@ def cached_load_hf_config(model_path: str) -> PretrainedConfig:
     return type(config)(**config.to_dict())
 
 
+def stage_shards(weight_map: dict) -> list[str]:
+    """Шарды, в которых лежит хоть один нужный ЭТОЙ стадии тензор.
+
+    Стадия конвейера держит свои слои и не должна тащить чужие: на
+    Qwen3.8-Flash-Next это 335 ГиБ на узел вместо полутора-двух сотен, а
+    узлов в конвейере несколько. Шард берётся целиком, если в нём есть хоть
+    один нужный тензор, — резать файлы мы не умеем, да и незачем.
+
+    Без отрезка (целая модель) возвращаются все шарды, как и раньше.
+    """
+    from freetoken.distributed.info import try_get_stage_info
+
+    stage = try_get_stage_info()
+    if stage is None or stage.whole:
+        return sorted(set(weight_map.values()))
+    return sorted({shard for name, shard in weight_map.items() if stage.owns_key(name)})
+
+
 def _weight_allow_patterns(repo_id: str) -> list[str]:
     try:
         index = hf_hub_download(repo_id, SAFE_WEIGHTS_INDEX_NAME, tqdm_class=DisabledTqdm)
         with open(index, encoding="utf-8") as f:
-            shards = sorted(set(json.load(f)["weight_map"].values()))
+            shards = stage_shards(json.load(f)["weight_map"])
     except Exception as e:
         logger.warning(
             "no usable %s for %s (%s); falling back to *.safetensors",

@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+
+#: Номер слоя в имени тензора чекпоинта: `model.language_model.layers.7.…`,
+#: `model.layers.7.…`, `mtp.layers.0.…` — все пишут его одинаково.
+_LAYER_IN_KEY = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 
 
 @dataclass(frozen=True)
@@ -66,6 +71,18 @@ class StageInfo:
 
     def owns(self, layer_id: int) -> bool:
         return self.first <= layer_id < self.last
+
+    def owns_key(self, name: str) -> bool:
+        """Нужен ли этой стадии тензор с таким именем в чекпоинте.
+
+        Правило нарочно осторожное: отбрасывается только то, что ТОЧНО
+        принадлежит слоям другой стадии. Всё, чей слой из имени не
+        определяется — эмбеддинги, голова, башня зрения, — остаётся. Они
+        малы рядом со слоями, а ошибка в другую сторону — это модель,
+        которая молча стартует на половине весов.
+        """
+        found = _LAYER_IN_KEY.search(name)
+        return self.owns(int(found.group(1))) if found else True
 
 
 _STAGE: StageInfo | None = None

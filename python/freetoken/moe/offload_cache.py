@@ -822,9 +822,22 @@ class OffloadMoeCache:
         nvfp4 native adds the two global banks after each scale bank."""
         assert self.prefill_overlap
         assert self.prefill_bank_buffers
+        # Ждать банк, которого в наборе нет, — всегда ошибка адресации, и сказать
+        # об этом надо здесь. Забегание вперёд (`prefetch(layer_id + 1)`) выходит
+        # за набор законно и молча, поэтому охранник там мягкий; из-за этого стенд
+        # 2026-09-27 получил пустой AssertionError вместо имени причины: стадия
+        # адресовала банки глобальным номером слоя.
+        if not 0 <= layer_id < self.num_layers:
+            raise IndexError(
+                f"банк экспертов {layer_id} вне набора ({self.num_layers} банков): "
+                "кэш адресуется индексом банка, а не глобальным номером слоя"
+            )
         self.prefetch_prefill_layer(layer_id)
         buffer_id = layer_id % 2
-        assert self._prefill_buffer_layer[buffer_id] == layer_id
+        assert self._prefill_buffer_layer[buffer_id] == layer_id, (
+            f"буфер префетча держит слой {self._prefill_buffer_layer[buffer_id]}, "
+            f"а нужен {layer_id}"
+        )
         if self.prefill_ready_events:
             torch.cuda.current_stream(self.device).wait_event(self.prefill_ready_events[buffer_id])
         return tuple(buffer[buffer_id] for buffer in self.prefill_bank_buffers)

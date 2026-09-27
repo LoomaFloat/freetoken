@@ -23,6 +23,8 @@ from freetoken.layers import BaseOP, OPList, ParallelLMHead, VocabParallelEmbedd
 from freetoken.models.blocks import BaseLLMModel
 from freetoken.utils import nvtx_annotate
 
+from freetoken.moe.expert_pieces import bank_layer_of
+
 from .attention import Qwen4ExpAttention
 from .hc import GatedResidual
 from .moe import Qwen4ExpMoE
@@ -65,7 +67,14 @@ class Qwen4ExpDecoderLayer(BaseOP):
             self.linear_attn = build_linear_mixer(config, layer_id, f"{prefix}.linear_attn")
         else:
             self.self_attn = Qwen4ExpAttention(config, layer_id, prefix=f"{prefix}.self_attn")
-        self.mlp = Qwen4ExpMoE(config, layer_id, prefix=f"{prefix}.mlp")
+        # Банки экспертов нумерованы ОТ СТАДИИ — так их складывает читалка, и
+        # так их адресует кэш офлоуда. `layer_id` здесь глобальный: у хвоста
+        # 24..47. Стенд 2026-09-27: хвост просил банк 24 из 24, префетч МОЛЧА
+        # выходил по `layer_id >= num_layers`, и падало на ассерте в
+        # `wait_prefill_layer` — сотней строк дальше причины.
+        bank_layer = bank_layer_of(config, layer_id)
+        assert bank_layer is not None, f"слой {layer_id} собран как MoE, а банка экспертов у него нет"
+        self.mlp = Qwen4ExpMoE(config, bank_layer, prefix=f"{prefix}.mlp")
         self.attn_hyper_connection = GatedResidual(config, prefix=f"{prefix}.attn_hyper_connection")
         self.mlp_hyper_connection = GatedResidual(config, prefix=f"{prefix}.mlp_hyper_connection")
         self.ple = (

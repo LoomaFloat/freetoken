@@ -186,6 +186,11 @@ def test_the_edges_go_to_the_edges(checkpoint):
 
 def _stage_dict(path: str, span: str) -> dict:
     """State dict модели, собранной движком для этого отрезка."""
+    return _stage_model(path, span).state_dict()
+
+
+def _stage_model(path: str, span: str):
+    """Сама модель, собранная движком для этого отрезка, на meta-устройстве."""
     clear_stage_info()
     from freetoken.engine.config import EngineConfig
     from freetoken.engine.engine import _decode_target
@@ -205,10 +210,35 @@ def _stage_dict(path: str, span: str) -> dict:
     rotary.get_rope.cache_clear()
     try:
         with torch.device("meta"), torch_dtype(torch.bfloat16):
-            return create_model(config.model_config).state_dict()
+            return create_model(config.model_config)
     finally:
         rotary.set_rope_device(saved)
         rotary.get_rope.cache_clear()
+
+
+@pytest.mark.parametrize("span, first", [("0:2", 0), ("2:4", 2), ("1:3", 1)])
+def test_moe_addresses_its_banks_from_the_stage(checkpoint, span, first):
+    """Кэш экспертов адресуется индексом банка, а банки нумерованы от стадии.
+
+    Стенд 2026-09-27: оба ранга поднялись, а на первом же запросе хвост
+    (24..47) умер в `wait_prefill_layer`. Он просил банк 24 из 24: модель
+    отдавала в MoE глобальный номер слоя, а префетч на выходе за набор
+    МОЛЧА ничего не делал, и падало сотней строк дальше.
+    """
+    path, _raw = checkpoint
+    model = _stage_model(path, span)
+    layers = model.model.layers.op_list
+    assert [layer.mlp.experts.layer_id for layer in layers] == list(range(len(layers)))
+    # И глобальный номер у слоя при этом свой: банк — не замена ему.
+    assert [layer._layer_id for layer in layers] == [first, first + 1]
+
+
+def test_the_whole_model_numbers_banks_as_before(checkpoint):
+    """Без отрезка нумерация та же, что до конвейера: правка не трогает рабочий путь."""
+    path, _raw = checkpoint
+    layers = _stage_model(path, "").model.layers.op_list
+    assert [layer.mlp.experts.layer_id for layer in layers] == [layer._layer_id for layer in layers]
+    assert len(layers) == LAYERS
 
 
 def test_two_stages_are_the_model_cut_not_rebuilt(checkpoint):

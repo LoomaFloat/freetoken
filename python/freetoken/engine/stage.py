@@ -63,13 +63,29 @@ def needs_incoming(model_config) -> bool:
 def graphs_allowed(model_config) -> bool:
     """Можно ли захватывать CUDA-графы.
 
-    На стадии — пока нет. Вход не-первой стадии приезжает снаружи, а граф
-    требует буфера по фиксированному адресу; сделать это можно (дисковая
-    таблица PLE ровно так и синхронизируется через флаг и `memop_wait`), но
-    это отдельная работа. До неё стадия считает в eager: медленнее, но не
-    молча неправильно.
+    На стадии — пока нет, и причин две. Вход не-первой стадии приезжает
+    снаружи, а граф требует буфера по фиксированному адресу. А выход
+    не-последней — это остаток, а захват пишет выход в буфер ЛОГИТОВ: стенд
+    2026-09-27, `expanded size (248320) must match existing size (10240)` —
+    ширина словаря против ширины остатка.
+
+    Сделать графы на стадии можно (дисковая таблица PLE ровно так и
+    синхронизируется через флаг и `memop_wait`), но это отдельная работа. До
+    неё стадия считает в eager: медленнее, но не молча неправильно.
     """
     return getattr(model_config, "layer_range", None) is None
+
+
+def graph_batch_sizes(model_config, requested):
+    """Размеры батча для захвата графов; пустой список — захвата нет.
+
+    Отдельной функцией, потому что охранник должен быть ОДИН. Со стенда
+    2026-09-27: `graphs_allowed` стояла только в `forward_batch`, а захват
+    идёт при сборке движка — и стадия падала на захвате, не дожив до первого
+    запроса. Решение о графах принимается здесь, а зовётся там, где
+    строится GraphRunner.
+    """
+    return requested if graphs_allowed(model_config) else []
 
 
 def stage_input(batch: Batch, *, link: StageLink | None, model_config) -> None:
@@ -113,8 +129,8 @@ def stage_output(
     return tokens
 
 
-__all__ = ["StageLink", "attach_stage_link", "graphs_allowed", "needs_incoming",
-           "stage_input", "stage_output"]
+__all__ = ["StageLink", "attach_stage_link", "graph_batch_sizes", "graphs_allowed",
+           "needs_incoming", "stage_input", "stage_output"]
 
 
 def attach_stage_link(engine, config) -> None:

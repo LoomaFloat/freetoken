@@ -26,7 +26,7 @@ from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_fa
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
-from .stage import StageLink, graphs_allowed, stage_input, stage_output
+from .stage import StageLink, graph_batch_sizes, graphs_allowed, stage_input, stage_output
 from freetoken.kvcache import create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
 from freetoken.kvcache.cache_status import _supports_swa_ratio
@@ -461,7 +461,9 @@ class Engine:
             device=self.device,
             model=self.model,
             attn_backend=self.attn_backend,
-            cuda_graph_bs=config.cuda_graph_bs,
+            # Пусто у стадии конвейера: захват пишет выход в буфер логитов, а
+            # у не-последней стадии выход — остаток другой ширины.
+            cuda_graph_bs=graph_batch_sizes(config.model_config, config.cuda_graph_bs),
             cuda_graph_max_bs=config.cuda_graph_max_bs,
             free_memory=init_free_memory,
             max_seq_len=aligned_max_seq_len,
@@ -1067,6 +1069,13 @@ class Engine:
                         batch.positions.unsqueeze(0).expand(3, -1).contiguous()
                     )
                 batch.out_loc = dummy_row[:length]
+                # Стадия, которая не строит эмбеддингов, без остатка считать
+                # отказывается — и правильно делает. Для прогрева нули той же
+                # ширины: путь через Triton они прогревают так же.
+                width = self.model.stage_input_width
+                if width:
+                    batch.stage_hidden = torch.zeros(
+                        length, width, dtype=self.dtype, device=self.device)
                 self.attn_backend.prepare_metadata(batch)
                 with self.ctx.forward_batch(batch):
                     self.model.forward()

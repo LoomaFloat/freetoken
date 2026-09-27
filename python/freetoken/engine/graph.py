@@ -98,6 +98,23 @@ def _determine_cuda_graph_bs(
     return [bs for bs in candidates if bs <= cuda_graph_max_bs]
 
 
+def capture_refusal(model: BaseLLMModel) -> str:
+    """Почему для этой модели графы не захватываются; пусто — можно.
+
+    Стоит ЗДЕСЬ, у самого захвата, а не только у сборщика движка. Со стенда
+    2026-09-27: решение о графах принималось в одном месте, а захват идёт в
+    другом, и стадия падала на захвате — `expanded size (248320) must match
+    existing size (10240)`, ширина словаря против ширины остатка.
+    """
+    if not getattr(model, "produces_logits", True):
+        return ("эта стадия логитов не считает, а захват пишет выход в их буфер: "
+                "у неё выход — остаток другой ширины")
+    if getattr(model, "stage_input_width", 0):
+        return ("вход этой стадии приезжает от соседа, а граф требует буфера "
+                "по фиксированному адресу")
+    return ""
+
+
 def get_free_memory(device: torch.device) -> int:
     return torch.cuda.mem_get_info(device)[0]
 
@@ -145,6 +162,11 @@ class GraphRunner:
         # graphs-disabled early return so that config gets the phase too.
         emit_progress("Capturing CUDA graphs / warming up", 0, 0)
         self.graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
+        why = capture_refusal(model)
+        if why:
+            self.max_graph_bs = 0
+            self.graph_bs_list = []
+            return logger.info_rank0(f"CUDA graph is disabled: {why}")
         if self.max_graph_bs == 0:
             return logger.info_rank0("CUDA graph is disabled.")
 

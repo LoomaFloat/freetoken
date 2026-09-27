@@ -250,3 +250,57 @@ def test_a_configured_stage_gets_a_link():
         if engine.stage_link is not None:
             engine.stage_link.close()
         relay.close()
+
+
+# ------------------------------------------------------------------ графы
+#
+# Стенд 2026-09-27: `graphs_allowed` стояла только в `forward_batch`, а захват
+# идёт при СБОРКЕ движка — стадия падала на захвате, не дожив до первого
+# запроса: `expanded size (248320) must match existing size (10240)`, ширина
+# словаря против ширины остатка. Охранник должен быть один.
+
+
+def test_the_whole_model_keeps_its_graphs():
+    from freetoken.engine.stage import graph_batch_sizes, graphs_allowed
+
+    whole = SimpleNamespace(layer_range=None)
+
+    assert graphs_allowed(whole)
+    assert graph_batch_sizes(whole, [1, 2, 4]) == [1, 2, 4]
+    assert graph_batch_sizes(whole, None) is None      # пусть решает движок
+
+
+def test_a_stage_captures_no_graphs():
+    """Пустой список — штатный путь «графы выключены» в GraphRunner."""
+    from freetoken.engine.stage import graph_batch_sizes, graphs_allowed
+
+    stage = SimpleNamespace(layer_range=(24, 48))
+
+    assert not graphs_allowed(stage)
+    assert graph_batch_sizes(stage, [1, 2, 4]) == []
+    assert graph_batch_sizes(stage, None) == []
+
+
+def test_an_empty_list_really_means_no_capture():
+    """Проверяется не наше намерение, а то, как его понимает GraphRunner:
+    пустой список -> max_graph_bs 0 -> ранний возврат из захвата."""
+    from freetoken.engine.graph import _determine_cuda_graph_bs
+
+    chosen = _determine_cuda_graph_bs(cuda_graph_bs=[], cuda_graph_max_bs=None,
+                                      free_memory=64 << 30)
+
+    assert chosen == []
+    assert max(chosen, default=0) == 0
+
+
+def test_capture_refuses_a_stage_at_the_capture_itself():
+    """Второй охранник, у самого захвата: забыть его на месте вызова нельзя."""
+    from freetoken.engine.graph import capture_refusal
+
+    whole = SimpleNamespace(produces_logits=True, stage_input_width=0)
+    head = SimpleNamespace(produces_logits=False, stage_input_width=0)
+    tail = SimpleNamespace(produces_logits=True, stage_input_width=10240)
+
+    assert capture_refusal(whole) == ""
+    assert "остаток другой ширины" in capture_refusal(head)
+    assert "фиксированному адресу" in capture_refusal(tail)

@@ -346,3 +346,20 @@ def test_graphs_are_off_on_a_stage():
     assert graphs_allowed(_config())
     clear_stage_info()
     assert not graphs_allowed(_config("2:4"))
+
+
+def test_the_stage_says_how_wide_its_input_is():
+    """Прогрев гоняет forward до первого запроса, а стадия без эмбеддингов
+    без остатка считать отказывается — ширину он спрашивает у модели."""
+    from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM
+
+    clear_stage_info()
+    whole = Qwen4ExpForCausalLM(_config())
+    clear_stage_info()
+    head = Qwen4ExpForCausalLM(_config("0:2"))
+    clear_stage_info()
+    tail = Qwen4ExpForCausalLM(_config("2:4"))
+
+    assert whole.stage_input_width == 0 and whole.produces_logits
+    assert head.stage_input_width == 0 and not head.produces_logits
+    assert tail.stage_input_width == 4 * DIM and tail.produces_logits

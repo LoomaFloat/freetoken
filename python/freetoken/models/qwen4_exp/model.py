@@ -249,6 +249,12 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         return table.bank.nbytes
 
     @property
+    def stage_input_width(self) -> int:
+        """Ширина остатка на входе: четыре потока гиперсоединений по hidden.
+        Ноль у первой стадии и у целой модели — они входят из эмбеддингов."""
+        return 0 if self.model.embed_tokens is not None else self.model.stream_width
+
+    @property
     def produces_logits(self) -> bool:
         """Считает ли эта стадия логиты.
 

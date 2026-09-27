@@ -30,6 +30,15 @@ class BaseLLMModel(ABC, BaseOP):
     def forward(self) -> torch.Tensor: ...
 
     @property
+    def stage_input_width(self) -> int:
+        """Ширина остатка, который эта стадия ждёт на входе; 0 — не ждёт.
+
+        Нужна прогреву: он гоняет forward до первого запроса, а стадия без
+        эмбеддингов без остатка считать отказывается.
+        """
+        return 0
+
+    @property
     def produces_logits(self) -> bool:
         """Считает ли ``forward`` логиты.
 

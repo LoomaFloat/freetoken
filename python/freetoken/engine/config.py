@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, List
 import torch
 from freetoken.distributed import DistributedInfo, set_stage_info
 from freetoken.layers.quantization import set_quant_config
-from freetoken.mm.config import ENCODER_SECTIONS, MultimodalConfig
+from freetoken.mm.config import ENCODER_KINDS, ENCODER_SECTIONS, MultimodalConfig
 from freetoken.models.register import EncoderSpec, ModelSpec, _load_attr, checkpoint_quant_config, get_model_spec
 from freetoken.utils import cached_load_hf_config, init_logger
 
@@ -103,6 +103,17 @@ class EngineConfig:
     mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 
     def __post_init__(self):
+        if not self.owns_first_layer and not self.mm.text_model_only:
+            # Башня энкодера кормит эмбеддинги, а эмбеддинги — на первой
+            # стадии. Здесь её некуда подключить: вес башни читалка
+            # отбрасывает (`_stage_keeps`), и построенная башня — это
+            # KeyError в load_state_dict. Гасим ровно как --text-model-only
+            # и ровно в одном месте: active_encoders, model_config,
+            # процессор и отказы на картинку смотрят сюда же.
+            object.__setattr__(
+                self, "mm", replace(self.mm, disabled_encoders=frozenset(ENCODER_KINDS))
+            )
+            logger.info("стадия не первая: башни энкодеров не строим")
         if self.moe_backend is None:
             return
         if self.moe_strategy != "auto":
@@ -110,6 +121,21 @@ class EngineConfig:
         logger.warning("EngineConfig.moe_backend is deprecated; use moe_strategy")
         object.__setattr__(self, "moe_strategy", self.moe_backend)
         object.__setattr__(self, "moe_backend", None)
+
+    @property
+    def owns_first_layer(self) -> bool:
+        """Держит ли процесс вход модели: эмбеддинги, n-граммы, башни энкодеров.
+
+        Отрезок целиком проверяет :func:`_stage_view` — там известно число
+        слоёв; здесь нужен только первый номер, а он от него не зависит.
+        Невнятный отрезок тут не глушим: о нём скажет разбор, и внятно.
+        """
+        if not self.layer_range:
+            return True
+        try:
+            return int(self.layer_range.partition(":")[0]) == 0
+        except ValueError:
+            return True
 
     @cached_property
     def hf_config(self):
@@ -121,7 +147,7 @@ class EngineConfig:
 
     @cached_property
     def active_encoders(self) -> tuple[EncoderSpec, ...]:
-        """The encoder towers this process builds: the family registers them, the checkpoint config carries their section, --mm-disable did not name them."""
+        """The encoder towers this process builds: the family registers them, the checkpoint config carries their section, --mm-disable did not name them (and on a pipeline stage that is not first, __post_init__ named them all)."""
         return tuple(
             e
             for e in self.model_spec.encoders

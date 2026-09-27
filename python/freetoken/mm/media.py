@@ -31,6 +31,12 @@ def collect_image_refs(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def image_reject_reason(config: ServerArgs) -> str | None:
     """None when this server can accept image inputs, else the client-facing reason."""
+    if config.stage_size > 1:
+        # Башню строит только первая стадия — эмбеддинги её, и они её. Но
+        # позиции t/h/w картинки живут в запросе, а до хвоста конвейера
+        # доезжает только остаток: он считал бы картинку обычным текстом и
+        # ответил бы молча неправильно. Лучше отказать вслух.
+        return "image input is not supported across pipeline stages (--layer-range)"
     if "image" in config.served_modalities:
         return None
     if config.mm.text_model_only:

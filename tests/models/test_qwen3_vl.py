@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from freetoken.distributed import DistributedInfo
+from freetoken.distributed import DistributedInfo, clear_stage_info, get_stage_info
 from freetoken.engine.config import EngineConfig
 from freetoken.mm import MM_PAD_SHIFT_VALUE
 from freetoken.mm.config import ENCODER_KINDS, MultimodalConfig
@@ -76,6 +76,69 @@ def test_text_model_only_hands_the_parser_a_config_without_vision(monkeypatch):
     assert not c.served_modalities
     assert not c.model_config.is_multimodal and not c.model_config.model_is_mrope
     assert hf.vision_config is not None  # the cached checkpoint config is left alone
+
+
+@pytest.fixture
+def stage():
+    """Отрезок слоёв — настройка окружающая, между тестами она течёт."""
+    clear_stage_info()
+    yield
+    clear_stage_info()
+
+
+def test_first_stage_of_a_pipeline_builds_the_tower(monkeypatch, stage):
+    c = _engine_config(monkeypatch, _hf_config(), object(), layer_range="0:2")
+    assert [e.kind for e in c.active_encoders] == ["vision"] and c.served_modalities == {"image"}
+    assert c.model_config.is_multimodal and not c.mm.text_model_only
+
+
+def test_a_later_stage_builds_no_tower(monkeypatch, stage):
+    """Башню кормят эмбеддинги, а эмбеддинги — на первой стадии.
+
+    Стенд 2026-09-27: хвост (слои 24:48) башню построил, читалка её вес
+    отбросила, и load_state_dict упал с KeyError
+    'visual.patch_embed.proj.weight'.
+    """
+    c = _engine_config(monkeypatch, _hf_config(), object(), layer_range="2:4")
+    assert c.active_encoders == () and not c.served_modalities
+    assert not c.model_config.is_multimodal and c.mm.text_model_only
+
+
+def test_the_tower_gate_runs_before_the_moe_backend_shortcut(monkeypatch, stage):
+    """__post_init__ выходит рано, когда moe_backend не задан. Гейт стоит до выхода."""
+    c = _engine_config(monkeypatch, _hf_config(), object(), layer_range="2:4", moe_backend="offload")
+    assert c.mm.text_model_only and c.moe_strategy == "offload"
+
+
+@pytest.mark.parametrize("text", ["0:2", "1:3", "2:4"])
+def test_the_gate_and_the_weight_reader_read_the_same_stage(monkeypatch, text, stage):
+    """Гейт башни смотрит на строку отрезка, читалка весов — на окружающую стадию.
+
+    Разойдутся — и снова получишь построенную башню без весов. Здесь они
+    сверяются на одном и том же отрезке.
+    """
+    c = _engine_config(monkeypatch, _hf_config(), object(), layer_range=text)
+    c.model_config  # он же и ставит окружающую стадию
+    assert c.owns_first_layer is get_stage_info(c.model_config.num_layers).is_first
+
+
+def test_a_whole_model_owns_its_first_layer(monkeypatch, stage):
+    c = _engine_config(monkeypatch, _hf_config(), object())
+    assert c.owns_first_layer and not c.mm.text_model_only
+
+
+def test_a_pipeline_refuses_image_input(monkeypatch, stage):
+    """Голова башню строит, но t/h/w-позиции картинки до хвоста не доедут: до него
+    доезжает только остаток. Ответить молча и неправильно — хуже, чем отказать."""
+    from freetoken.mm.media import image_reject_reason
+
+    piped = _engine_config(monkeypatch, _hf_config(), object(), layer_range="0:2", stage_size=2)
+    assert "image" in piped.served_modalities  # башня на месте, отказ не из-за неё
+    assert image_reject_reason(piped) == (
+        "image input is not supported across pipeline stages (--layer-range)"
+    )
+    clear_stage_info()
+    assert image_reject_reason(_engine_config(monkeypatch, _hf_config(), object())) is None
 
 
 @pytest.mark.parametrize("kinds, served", [({"vision"}, set()), ({"audio"}, {"image"})])

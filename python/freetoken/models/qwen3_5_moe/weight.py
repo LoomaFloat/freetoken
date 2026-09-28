@@ -383,36 +383,44 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | 
     if get_tp_info().size > 1:
         raise NotImplementedError("qwen3_5_moe fp8 expert banks support TP=1 only")
     from freetoken.models.weight import experts_scattered, iter_expert_tensors_parallel
-    from freetoken.moe.expert_pieces import per_expert_pieces
+    from freetoken.moe.expert_pieces import bank_layer_of, per_expert_pieces
 
-    L, E, H, I, dense = _moe_dims(config)
+    E = config.num_experts
     scale = get_quant_config().stored_tensors(QuantKind.FP8_BLOCK)["weight_scale_inv"].name
     key_re = re.compile(_FP8_EXPERT_KEY_RE.format(scale=re.escape(scale)))
     suffix = {"weight": "", scale: "_scale"}
+    # Checkpoint layer -> bank of THIS stage; a pipeline stage owns only its layer range,
+    # and num_moe_layers counts that range while num_layers is the whole model.
+    banks = {layer: bank for layer in config.local_layer_ids
+             if (bank := bank_layer_of(config, layer)) is not None}
 
     def locate(raw_name: str):
         m = key_re.match(raw_name)
         if m is None:
             return None
-        li = int(m["layer"]) - dense
-        if not 0 <= li < L:
+        layer = int(m["layer"])
+        if not 0 <= layer < config.num_layers:
             raise ValueError(f"unexpected routed-expert layer in {raw_name}")
-        return li, int(m["expert"]), m["proj"] + suffix[m["kind"]]
+        if layer not in banks:
+            return None  # another stage's layer
+        return banks[layer], int(m["expert"]), m["proj"] + suffix[m["kind"]]
+
+    def mine(raw_name: str) -> bool:
+        m = key_re.match(raw_name)
+        return m is not None and int(m["layer"]) in banks
 
     if parallel is None:
         parallel = experts_scattered(model_path)
     if parallel:
-        tensors = iter_expert_tensors_parallel(
-            model_path, lambda n: key_re.match(n) is not None, workers=workers, chunk=chunk
-        )
+        tensors = iter_expert_tensors_parallel(model_path, mine, workers=workers, chunk=chunk)
         return per_expert_pieces(tensors, locate, tensors_per_expert=6)
 
     def _serial():
         reader = ShardReader(model_path, torch.device("cpu"))
         try:
-            for li in tqdm(range(L), desc="Loading fp8 experts (serial)", disable=not get_tp_info().is_primary()):
+            for layer in tqdm(sorted(banks), desc="Loading fp8 experts (serial)", disable=not get_tp_info().is_primary()):
                 for e in range(E):
-                    base = f"model.language_model.layers.{dense + li}.mlp.experts.{e}"
+                    base = f"model.language_model.layers.{layer}.mlp.experts.{e}"
                     for proj in ("gate", "up", "down"):
                         for kind, suf in suffix.items():
                             name = f"{base}.{proj}_proj.{kind}"

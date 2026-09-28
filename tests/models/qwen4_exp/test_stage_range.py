@@ -26,7 +26,7 @@ from freetoken.models.qwen4_exp.config import parse_config
 from freetoken.models.qwen4_exp.weight import iter_weights
 from freetoken.utils import cached_load_hf_config
 
-from .common import hf_config, install_quant_config, meta_state_dict
+from .common import QWEN_FP8, hf_config, install_quant_config, meta_state_dict
 
 H, E, I = 128, 3, 6
 LAYERS = 4
@@ -309,3 +309,54 @@ def test_the_whole_model_still_reads_every_layer(checkpoint):
 
     assert [p[0] for p in pieces] == [0, 1, 2, 3]
     assert torch.equal(pieces[0][3]["gate_up"], raw[f"{LM}.layers.0.mlp.experts.gate_up_proj"])
+
+
+# ------------------------------------------------------------------ fp8-эксперты
+
+FP8 = torch.float8_e4m3fn
+
+
+@pytest.fixture(scope="module")
+def fp8_checkpoint(tmp_path_factory, checkpoint):
+    """Тот же конфиг, но эксперты по одному, как в Qwen/Qwen3.8-Flash-Next-FP8.
+
+    Стенд 2026-09-28: эта модель шла целиком на одной ноде и падала нулевым
+    рангом конвейера на собственном слое 0 — FP8-читалка (qwen3_5_moe) считала
+    плотный префикс как ``num_layers - num_moe_layers``, а у стадии второе —
+    это её 2 слоя из 4, и слой 0 выходил банком −2.
+    """
+    src, _ = checkpoint
+    folder = tmp_path_factory.mktemp("qwen4_exp_stage_fp8")
+    raw: dict[str, torch.Tensor] = {}
+    for layer in range(LAYERS):
+        for e in range(E):
+            base = f"{LM}.layers.{layer}.mlp.experts.{e}"
+            for proj, shape in (("gate", (I, H)), ("up", (I, H)), ("down", (H, I))):
+                raw[f"{base}.{proj}_proj.weight"] = torch.randn(*shape).to(FP8)
+                raw[f"{base}.{proj}_proj.weight_scale_inv"] = _bf16(1, 1)
+    names = sorted(raw)
+    save_file({n: raw[n] for n in names[::2]}, str(folder / "model-fp8-00001.safetensors"))
+    save_file({n: raw[n] for n in names[1::2]}, str(folder / "model-fp8-00002.safetensors"))
+    cfg = json.loads((__import__("pathlib").Path(src) / "config.json").read_text())
+    cfg["quantization_config"] = QWEN_FP8
+    (folder / "config.json").write_text(json.dumps(cfg))
+    return str(folder), raw
+
+
+@pytest.mark.parametrize("parallel", [False, True], ids=["serial", "parallel"])
+@pytest.mark.parametrize("span, layers", [("0:2", (0, 1)), ("2:4", (2, 3)), ("", (0, 1, 2, 3))],
+                         ids=["head", "tail", "whole"])
+def test_fp8_experts_come_from_this_stage_layers(fp8_checkpoint, span, layers, parallel):
+    """Через точку входа движка: банк от стадии, чужие слои не читаются."""
+    from freetoken.moe.expert_pieces import iter_expert_pieces as engine_pieces
+
+    path, raw = fp8_checkpoint
+    config = _config(path, span)
+
+    pieces = list(engine_pieces(path, config, QuantKind.FP8_BLOCK, parallel=parallel, workers=2))
+
+    got = sorted((p[0], p[1]) for p in pieces)
+    assert got == [(bank, e) for bank in range(len(layers)) for e in range(E)]
+    for bank, e, _e1, piece in pieces:
+        name = f"{LM}.layers.{layers[bank]}.mlp.experts.{e}.gate_proj.weight"
+        assert torch.equal(piece["gate"][0].view(torch.uint8), raw[name].view(torch.uint8))

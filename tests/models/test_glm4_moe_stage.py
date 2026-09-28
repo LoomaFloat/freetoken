@@ -218,6 +218,21 @@ def test_the_bf16_expert_reader_takes_this_stage_and_never_the_mtp_layer(checkpo
         assert torch.equal(piece[proj][0], tensors[f"model.layers.{first_moe}.mlp.experts.1.{proj}_proj.weight"])
 
 
+@pytest.mark.parametrize("parallel", [False, None])
+def test_the_engine_entry_reaches_the_family_reader(checkpoint, parallel):
+    """The engine looks the hook up on the family PACKAGE, not on weight.py. Stand
+    2026-09-28: it was not exported, the engine fell through to the generic bf16 path and
+    died on iter_weights' assert, after half an hour of loading. Called directly the
+    reader worked, which is why only this entry point catches it."""
+    from freetoken.layers.quantization import QuantKind
+    from freetoken.moe.expert_pieces import iter_expert_pieces
+
+    path, _ = checkpoint
+    _, config = _model("", path)
+    pieces = list(iter_expert_pieces(path, config, QuantKind.NONE, parallel=parallel))
+    assert len(pieces) == (LAYERS - FIRST_DENSE) * EXPERTS
+
+
 def test_a_bf16_piece_fills_the_bank_gate_first():
     """The unquantized bank is [gate; up] per expert; the reader hands gate and up apart."""
     from freetoken.layers.quantization.moe.base import fused_piece

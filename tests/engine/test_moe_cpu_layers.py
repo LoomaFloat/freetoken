@@ -65,3 +65,62 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+# ---- auto strategy under a pin cap (WSL): lock the over-budget layers instead of refusing ----
+
+GiB = 2**30
+
+
+def _auto_config(monkeypatch, *, budget, banks, viable=True, **overrides):
+    """A bare-invocation bf16 MoE config; the pin cap, bank size and CPU executor are stubbed."""
+    import torch
+
+    import freetoken.engine.engine as engine
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+    from freetoken.moe import bench_profile
+
+    monkeypatch.setattr(engine, "_pin_budget_bytes", lambda reserved=0: budget)
+    monkeypatch.setattr(engine, "_bank_bytes", lambda config, method=None: banks)
+    monkeypatch.setattr(engine, "_cpu_moe_executor_viable", lambda model_config: viable)
+    monkeypatch.setattr(bench_profile, "load_backend_recommendation", lambda *a, **k: "offload")
+    config = EngineConfig(model_path="/tmp/freetoken-test-model", tp_info=DistributedInfo(rank=0, size=1),
+                          dtype=torch.bfloat16, attention_backend="triton", **overrides)
+    object.__setattr__(config, "model_config", SimpleNamespace(
+        has_swa_attention=False, has_linear_attention=False, is_moe=True, num_layers=24,
+        num_moe_layers=24, num_experts=128, expert_quant="none", hidden_act="silu",
+        moe_strategy="auto"))
+    return config
+
+
+def test_auto_locks_cpu_layers_when_banks_exceed_the_pin_cap(monkeypatch):
+    """Stand 2026-09-28: 27.0 GiB of banks against a 24.9 GiB WSL cap refused to boot."""
+    from freetoken.engine.engine import _adjust_config
+
+    config = _auto_config(monkeypatch, budget=int(24.9 * GiB), banks=27 * GiB)
+    _adjust_config(config)
+    assert config.moe_strategy == "offload" and config.moe_cpu_layers == "auto"
+    assert config.model_config.decode_target == "cpu"
+
+
+@pytest.mark.parametrize("budget, banks, viable", [
+    (int(24.9 * GiB), 20 * GiB, True),    # banks fit: nothing to lock
+    (None, 27 * GiB, True),               # plain Linux: no cap at all
+    (int(24.9 * GiB), 27 * GiB, False),   # no CPU executor: keep the actionable refusal
+])
+def test_auto_leaves_cpu_layers_alone_otherwise(monkeypatch, budget, banks, viable):
+    from freetoken.engine.engine import _adjust_config
+
+    config = _auto_config(monkeypatch, budget=budget, banks=banks, viable=viable)
+    _adjust_config(config)
+    assert config.moe_cpu_layers is None
+
+
+def test_an_explicit_strategy_is_not_second_guessed(monkeypatch):
+    """Only an auto pick is adjusted; --moe-strategy offload keeps the loud pin-budget error."""
+    from freetoken.engine.engine import _adjust_config
+
+    config = _auto_config(monkeypatch, budget=int(24.9 * GiB), banks=27 * GiB, moe_strategy="offload")
+    _adjust_config(config)
+    assert config.moe_cpu_layers is None

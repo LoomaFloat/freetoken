@@ -1650,6 +1650,18 @@ def _adjust_config(config: EngineConfig):
         override("moe_strategy", default_backend)
         logger.info_rank0(f"Auto-selected MoE strategy: {config.moe_strategy}")
 
+        # An auto pick must boot: where pinning is capped (WSL), banks over the budget would
+        # stop _check_pin_budget, so lock just those layers for CPU decode instead.
+        if not config.moe_cpu_layers and _cpu_moe_executor_viable(model_config):
+            budget = _pin_budget_bytes()
+            banks = _bank_bytes(config) if budget is not None else None
+            if banks and banks > budget:
+                override("moe_cpu_layers", "auto")
+                logger.info_rank0(
+                    f"expert banks ({banks / 2**30:.1f} GiB) exceed the pin budget "
+                    f"({budget / 2**30:.1f} GiB); auto-selected --moe-cpu-layers auto"
+                )
+
         if (
             is_offload_moe_strategy(config.moe_strategy)
             and config.moe_cache_size <= 0

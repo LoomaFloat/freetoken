@@ -21,11 +21,12 @@ from typing import TYPE_CHECKING, Iterator
 
 import safetensors
 import torch
-from freetoken.distributed import get_stage_info, get_tp_info
+from freetoken.distributed import get_tp_info
 from freetoken.models.qwen3_vl.weight import rename_vl_prefix
 
 from freetoken.models.config import VISION_KEY_PREFIXES
 from freetoken.models.loader import drop_page_cache, iter_weight_files
+from freetoken.models.stage_weights import LAYER_KEY_RE, stage_keeps, stage_renumber
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
 )
@@ -112,53 +113,25 @@ def _rename(raw_name: str) -> str | None:
 
 
 #: Номер слоя в УЖЕ переименованном ключе (`model.layers.7.…`).
-_RENAMED_LAYER_RE = re.compile(r"(?P<head>(?:^|\.)layers\.)(?P<id>\d+)\.")
+_RENAMED_LAYER_RE = LAYER_KEY_RE
 
 
 def _stage_keeps(total_layers: int):
     """Фильтр «это моё» по переименованным ключам; None — стадия одна.
 
     Края достаются краям: эмбеддинги первой стадии, смеситель и `lm_head`
-    последней. Башня зрения идёт с эмбеддингами — она их и кормит; на
-    непервой стадии её вес отбрасывается, и если движок её всё-таки построил,
-    `load_state_dict` скажет об этом вслух, а не соберёт молча полумодель.
+    последней. Башня зрения идёт с эмбеддингами — она их и кормит.
     """
-    stage = get_stage_info(total_layers)
-    if stage.whole:
-        return None
-
-    def keep(name: str) -> bool:
-        match = _RENAMED_LAYER_RE.search(name)
-        if match is not None:
-            return stage.owns(int(match["id"]))
-        if name.startswith(VISION_KEY_PREFIXES) or name.startswith("model.embed_tokens"):
-            return stage.is_first
-        if name.startswith("lm_head") or name.startswith("model.hyper_connection_mixer"):
-            return stage.is_last
-        return True
-
-    return keep
+    return stage_keeps(
+        total_layers,
+        first_only=(*VISION_KEY_PREFIXES, "model.embed_tokens"),
+        last_only=("lm_head", "model.hyper_connection_mixer"),
+    )
 
 
 def _stage_renumber(total_layers: int):
-    """Глобальный номер слоя -> номер внутри стадии; None — стадия одна.
-
-    Стадия держит свои слои подряд с нуля: ``OPList`` нумерует их по порядку,
-    и у стадии со слоями 2..3 в state dict лежат ``layers.0`` и ``layers.1``.
-    А вот квантовые схемы ищутся по номеру ИЗ ЧЕКПОИНТА (у смешанной точности
-    они заданы послойно), поэтому переименование идёт в самом конце — после
-    того, как проекции слиты и схема уже спрошена.
-    """
-    stage = get_stage_info(total_layers)
-    if stage.whole:
-        return None
-
-    def local(name: str) -> str:
-        return _RENAMED_LAYER_RE.sub(
-            lambda m: f"{m['head']}{int(m['id']) - stage.first}.", name, count=1
-        )
-
-    return local
+    """Глобальный номер слоя -> номер внутри стадии; None — стадия одна."""
+    return stage_renumber(total_layers)
 
 
 def _split_kind(name: str) -> tuple[str, str]:

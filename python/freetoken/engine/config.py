@@ -169,6 +169,16 @@ class EngineConfig:
             if key not in built:
                 setattr(hf_config, key, None)
         spec = self.model_spec
+        if self.layer_range and not spec.supports_stages:
+            # Стенд 2026-09-28: Qwen3-30B-A3B на двух узлах. Движок сузил KV,
+            # число банков и скачивание до отрезка, а семейство построило все
+            # слои — голова упала на чужом слое экспертов, хвост на своём же
+            # недокачанном. Отказать здесь дешевле: до весов и до памяти.
+            raise ValueError(
+                f"--layer-range: семейство {spec.module} не умеет стадию конвейера, "
+                f"архитектуру {self.hf_config.architectures[0]} можно развернуть только "
+                "целиком на одном узле"
+            )
         quant = checkpoint_quant_config(self.model_path, hf_config, spec)
         set_quant_config(quant)
         model_config = _load_attr(spec.module, spec.parse_config)(hf_config)

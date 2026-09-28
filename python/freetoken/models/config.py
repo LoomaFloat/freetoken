@@ -412,9 +412,11 @@ class ModelConfig:
         )
 
     def default_full_attention_group(self) -> FullAttentionGroupConfig:
+        # Слои ЭТОЙ стадии: у модели без групп внимания `_stage_view` сужать
+        # нечего, и без этого KV на каждой стадии считался бы на все слои.
         return FullAttentionGroupConfig(
             name="full",
-            layer_ids=tuple(range(self.num_layers)),
+            layer_ids=self.local_layer_ids,
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim,
             rotary_config=self.rotary_config,
@@ -476,7 +478,7 @@ class ModelConfig:
             return (
                 KVCacheGroupSpec(
                     name="full",
-                    layer_ids=tuple(range(self.num_layers)),
+                    layer_ids=self.local_layer_ids,
                     num_kv_heads=self.num_kv_heads,
                     head_dim=self.head_dim,
                     sliding_window=None,

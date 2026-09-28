@@ -13,12 +13,17 @@ from freetoken.models.loader import (
     iter_weight_files,
     shard_tensor,
 )
+from freetoken.models.stage_weights import stage_keeps, stage_renumber
 from freetoken.utils import cached_load_hf_config
 from tqdm import tqdm
 
 from .config import parse_config
 
 _EXPERT_PATTERN = re.compile(r"^(?P<prefix>.+\.experts)\.(?P<idx>\d+)\.(?P<name>.+)$")
+#: Края стадии конвейера: эмбеддинги нужны только первой, финальная норма и
+#: lm_head — только последней (см. `stage_keeps`).
+_FIRST_ONLY = ("model.embed_tokens",)
+_LAST_ONLY = ("model.norm.", "lm_head")
 _MERGE_RULES = {
     ".q_proj": MergeRule(".qkv_proj", "q", ("q", "k", "v")),
     ".k_proj": MergeRule(".qkv_proj", "k", ("q", "k", "v")),
@@ -37,6 +42,8 @@ def iter_weights(
 ) -> Iterator[tuple[str, torch.Tensor]]:
     config = parse_config(cached_load_hf_config(model_path))
     tp_info = get_tp_info()
+    # Стадия конвейера: чужие слои из пограничных шардов не читаются вовсе.
+    keep = stage_keeps(config.num_layers, first_only=_FIRST_ONLY, last_only=_LAST_ONLY)
 
     def sharded_tensors() -> Iterator[tuple[str, torch.Tensor]]:
         for file in tqdm(
@@ -47,6 +54,8 @@ def iter_weights(
             with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
                 for raw_name in f.keys():
                     name = raw_name.removeprefix("language_model.")
+                    if keep is not None and not keep(name):
+                        continue
                     is_expert = _EXPERT_PATTERN.match(name) is not None
                     if is_expert and not include_moe_experts:
                         continue
@@ -69,12 +78,20 @@ def iter_weights(
         _MERGE_RULES,
         model_name="qwen3_moe",
     )
-    yield from iter_stacked_experts(
+    stacked = iter_stacked_experts(
         merged,
         num_experts=config.num_experts,
         model_name="qwen3_moe",
         expert_pattern=_EXPERT_PATTERN,
     )
+    # Номера слоёв — в местные, но только для state dict модели: читалке
+    # банков экспертов (один `include_moe_experts`) нужен глобальный номер.
+    renumber = stage_renumber(config.num_layers) if include_non_moe else None
+    if renumber is None:
+        yield from stacked
+    else:
+        for name, tensor in stacked:
+            yield renumber(name), tensor
 
 
 def iter_weights_parallel(
@@ -95,9 +112,11 @@ def iter_weights_parallel(
 
     config = parse_config(cached_load_hf_config(model_path))
     tp_info = get_tp_info()
+    keep = stage_keeps(config.num_layers)
 
     def _is_expert(raw_name: str) -> bool:
-        return _EXPERT_PATTERN.match(raw_name.removeprefix("language_model.")) is not None
+        name = raw_name.removeprefix("language_model.")
+        return _EXPERT_PATTERN.match(name) is not None and (keep is None or keep(name))
 
     def raw_experts() -> Iterator[tuple[str, torch.Tensor]]:
         for raw_name, raw in iter_expert_tensors_parallel(

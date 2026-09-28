@@ -32,6 +32,11 @@ class ModelSpec:
     # "module:Class" turning the checkpoint's media into items; None: the family takes no multimodal input
     mm_processor: str | None = None
     encoders: tuple[EncoderSpec, ...] = ()
+    # Умеет ли семейство стадию конвейера (--layer-range): модель строит свой
+    # отрезок слоёв и края, читалка отбирает и перенумеровывает веса. Движок
+    # стадийный и сам по себе (KV, число банков, скачивание), и без поддержки
+    # семейства получается полумодель — поэтому остальным он отказывает.
+    supports_stages: bool = False
 
 
 # Multimodal wrappers store the text tower under model.language_model.
@@ -105,6 +110,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.qwen3_moe",
         "Qwen3MoeForCausalLM",
         packed_modules_mapping=_DENSE_PACKED + _EXPERTS_PACKED,
+        supports_stages=True,
     ),
     # Qwen3-VL: the Qwen3 text tower under model.language_model. plus the shared Qwen VL vision tower with DeepStack; the MoE variant ships its experts pre-stacked.
     "Qwen3VLForConditionalGeneration": ModelSpec(
@@ -189,6 +195,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         mm_processor=_QWEN_VL_PROCESSOR,
         encoders=_QWEN_VL_ENCODERS,
         packed_modules_mapping=_QWEN4_EXP_PACKED,
+        supports_stages=True,
     ),
     # Dense Qwen3.x (no "Moe" in the arch name, num_experts==0, e.g. Qwen3.6-27B). Shares the
     # qwen3_5_moe package: the decoder routes its MLP through the dense Qwen3_5DenseMLP and the

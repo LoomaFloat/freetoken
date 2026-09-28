@@ -288,6 +288,23 @@ def test_a_pair_of_stages_chooses_the_same_token_as_the_whole_model():
     assert torch.equal(link.published, expected), "хвост разослал не то, что выбрал"
 
 
+def test_every_stage_marks_the_start_of_its_step():
+    """Начало forward нужно замеру даже там, где остаток не ждут.
+
+    У головы вход приходит не по связи, и без этой отметки её префилл в рядах
+    окна замера считался бы от последнего токена прошлого запроса.
+    """
+    class Marks(Pair):
+        def step_started(self):
+            self.calls.append("started")
+
+    for span, calls in (("0:2", ["started"]), ("2:4", ["started", "take"])):
+        clear_stage_info()
+        link = Marks(None, None, None)
+        stage_input(_batch(), link=link, model_config=_config(span))
+        assert link.calls == calls, span
+
+
 def test_the_head_never_samples_from_the_remainder():
     """Сэмпл из остатка — это молча выданный мусор, и решает не форма
     тензора, а `produces_logits`."""

@@ -54,6 +54,10 @@ class StageLink(ABC):
     def publish(self, batch: Batch, tokens: torch.Tensor) -> None:
         """Разослать выбранные токены назад по цепочке (делает последняя)."""
 
+    def step_started(self) -> None:
+        """Начался forward этой стадии. Нужен тому, кто меряет шаг: у первой
+        стадии вход приходит не по связи, и где начался префилл, иначе не видно."""
+
 
 def needs_incoming(model_config) -> bool:
     """Ждёт ли эта стадия остаток от предыдущей."""
@@ -90,6 +94,8 @@ def graph_batch_sizes(model_config, requested):
 
 def stage_input(batch: Batch, *, link: StageLink | None, model_config) -> None:
     """Положить в батч остаток предыдущей стадии, если он этой стадии нужен."""
+    if link is not None:
+        link.step_started()
     if not needs_incoming(model_config):
         return
     if link is None:

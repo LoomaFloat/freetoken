@@ -16,7 +16,9 @@ base64: остаток на декоде это 20 КБ, и удваивать �
 
 from __future__ import annotations
 
+import collections
 import http.client
+import json
 import os
 import queue
 import threading
@@ -57,6 +59,11 @@ SHAPE = "X-Looma-Stage-Shape"      # "3,10240"
 DTYPE = "X-Looma-Stage-Dtype"
 STEP = "X-Looma-Stage-Step"        # номер шага: рассинхрон должен быть слышен
 TO = "X-Looma-Stage-To"            # ранг назначения или "*" — всем остальным
+BUSY = "X-Looma-Stage-Busy-Ms"     # сколько последняя стадия считала этот шаг
+
+#: Сколько шагов голова помнит для рядов замера (`GET /timings`): на длинный
+#: ответ с запасом, запись — пять чисел.
+_SERIES_KEEP = 16384
 
 REMAINDER, TOKENS = "remainder", "tokens"
 
@@ -127,15 +134,36 @@ class HttpStageLink(StageLink):
         self._ended_at: float | None = None
         self._prefill = False
         self._report_every = _REPORT_EVERY
+        # Ряды для окна замера: по шагу голова знает свою часть, часть хвоста
+        # (хвост присылает её с токеном) и сеть — остаток своего ожидания.
+        self._began_at: float | None = None
+        self._peer_busy = 0.0
+        self._series: collections.deque = collections.deque(maxlen=_SERIES_KEEP)
+        self._series_lock = threading.Lock()
         self._server = self._listen(listen_port)
 
     # ------------------------------------------------------------ приём
     def _listen(self, port: int) -> ThreadingHTTPServer:
         inbox = self._inbox
+        link = self
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *_args):
                 pass
+
+            def do_GET(self):
+                url = urllib.parse.urlsplit(self.path)
+                if url.path != "/timings":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                since = urllib.parse.parse_qs(url.query).get("since", ["0"])[0]
+                body = json.dumps({"steps": link.series_since(float(since))}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
 
             def do_POST(self):
                 length = int(self.headers.get("Content-Length", 0))
@@ -146,7 +174,8 @@ class HttpStageLink(StageLink):
                     self.end_headers()
                     return
                 inbox[kind].put((body, self.headers.get(SHAPE, ""),
-                                 self.headers.get(DTYPE, ""), self.headers.get(STEP, "")))
+                                 self.headers.get(DTYPE, ""), self.headers.get(STEP, ""),
+                                 self.headers.get(BUSY, "")))
                 self.send_response(202)
                 self.end_headers()
 
@@ -158,7 +187,7 @@ class HttpStageLink(StageLink):
     def _await(self, kind: str) -> torch.Tensor:
         started = time.perf_counter()
         try:
-            body, shape, dtype, step = self._inbox[kind].get(timeout=self.timeout_s)
+            body, shape, dtype, step, busy = self._inbox[kind].get(timeout=self.timeout_s)
         except queue.Empty:
             raise StageProtocolError(
                 f"сосед не прислал {kind} за {self.timeout_s:g} с; конвейер встал"
@@ -169,6 +198,8 @@ class HttpStageLink(StageLink):
             )
         self._input_at = time.perf_counter()
         self._now_spent["ожидание"] += self._input_at - started
+        if kind == TOKENS:
+            self._peer_busy = float(busy) / 1e3 if busy else 0.0
         got = unpack(body, shape, dtype, device=self.device)
         if kind == REMAINDER and got.dim() and got.shape[0] > 1:
             self._prefill = True
@@ -177,26 +208,35 @@ class HttpStageLink(StageLink):
     # ------------------------------------------------------------ отправка
     def _post(self, kind: str, tensor: torch.Tensor, to: str) -> None:
         started = time.perf_counter()
-        if self._input_at is not None:
-            self._now_spent["счёт"] += started - self._input_at
-            self._input_at = None
         if kind == REMAINDER and tensor.dim() and tensor.shape[0] > 1:
             self._prefill = True
+        since = self._input_at
+        if self._prefill and self._began_at is not None:
+            # Вход префилла у первой стадии приходит не по связи: без начала
+            # forward счёт тянулся бы от последнего токена прошлого запроса.
+            since = self._began_at if since is None else max(since, self._began_at)
+        if since is not None:
+            self._now_spent["счёт"] += started - since
+        self._input_at = None
         # `pack` снимает тензор с карты синхронной копией, то есть ЖДЁТ всю
         # недосчитанную работу GPU этой стадии. Это счёт, а не сеть: первая
         # версия секундомера записывала его в сеть и путала одно с другим.
         body, shape, dtype = pack(tensor)
         packed = time.perf_counter()
         self._now_spent["выгрузка"] += packed - started
+        headers = {
+            "Content-Type": "application/octet-stream",
+            "Content-Length": str(len(body)),
+            KIND: kind, SHAPE: shape, DTYPE: dtype,
+            STEP: str(self._step), TO: to,
+        }
+        if kind == TOKENS and since is not None:
+            # Голове: из её ожидания это счёт хвоста, остальное — дорога.
+            headers[BUSY] = f"{1e3 * (packed - since):.3f}"
         parts = urllib.parse.urlsplit(self.send_url)
         connection = http.client.HTTPConnection(parts.netloc, timeout=self.timeout_s)
         try:
-            connection.request("POST", parts.path or "/", body=body, headers={
-                "Content-Type": "application/octet-stream",
-                "Content-Length": str(len(body)),
-                KIND: kind, SHAPE: shape, DTYPE: dtype,
-                STEP: str(self._step), TO: to,
-            })
+            connection.request("POST", parts.path or "/", body=body, headers=headers)
             answer = connection.getresponse()
             answer.read()
             if answer.status >= 300:
@@ -206,6 +246,9 @@ class HttpStageLink(StageLink):
             self._now_spent["сеть"] += time.perf_counter() - packed
 
     # ------------------------------------------------------------ StageLink
+    def step_started(self) -> None:
+        self._began_at = time.perf_counter()
+
     def take(self, batch: Batch) -> torch.Tensor:
         return self._await(REMAINDER)
 
@@ -237,6 +280,13 @@ class HttpStageLink(StageLink):
         self._ended_at = now
         spent, self._now_spent = self._now_spent, dict.fromkeys(BUCKETS, 0.0)
         prefill, self._prefill = self._prefill, False
+        peer, self._peer_busy = self._peer_busy, 0.0
+        if self.rank == 0:
+            # Префилл тоже в ряд: окну замера нулевая точка нужна как префилл.
+            own = spent["счёт"] + spent["выгрузка"]
+            wire = max(0.0, spent["сеть"] + spent["ожидание"] - peer)
+            with self._series_lock:
+                self._series.append((time.time(), own, peer, wire, prefill))
         if prefill or period is None or not self._report_every:
             return
         for name, value in spent.items():
@@ -275,9 +325,23 @@ class HttpStageLink(StageLink):
         for name in self._spent:
             self._spent[name] = 0.0
 
+    def series_since(self, since: float) -> list:
+        """Шаги головы, закончившиеся не раньше `since` (секунды по часам стены).
+
+        Время стены, а не монотонные часы: забирает посредник, другой процесс
+        на той же машине, и отрезок запроса он знает по своим часам.
+        """
+        with self._series_lock:
+            rows = [row for row in self._series if row[0] >= since]
+        return [
+            {"end": end, "head_ms": round(1e3 * own, 3), "peer_ms": round(1e3 * peer, 3),
+             "wire_ms": round(1e3 * wire, 3), "prefill": prefill}
+            for end, own, peer, wire, prefill in rows
+        ]
+
     def close(self) -> None:
         self._server.shutdown()
         self._server.server_close()
 
 
-__all__ = ["DTYPES", "HttpStageLink", "StageProtocolError", "pack", "unpack"]
+__all__ = ["BUSY", "DTYPES", "HttpStageLink", "StageProtocolError", "pack", "unpack"]

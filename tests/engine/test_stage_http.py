@@ -17,7 +17,7 @@ import pytest
 import torch
 
 from freetoken.engine.stage_http import (
-    DTYPE, KIND, SHAPE, STEP, TO, HttpStageLink, StageProtocolError, pack, unpack,
+    BUSY, DTYPE, KIND, SHAPE, STEP, TO, HttpStageLink, StageProtocolError, pack, unpack,
 )
 
 CPU = torch.device("cpu")
@@ -94,6 +94,7 @@ class Relay:
                     conn.request("POST", "/", body=body, headers={
                         KIND: kind, SHAPE: self.headers.get(SHAPE, ""),
                         DTYPE: self.headers.get(DTYPE, ""), STEP: self.headers.get(STEP, ""),
+                        BUSY: self.headers.get(BUSY, ""),
                         "Content-Length": str(len(body)),
                     })
                     conn.getresponse().read()
@@ -273,6 +274,80 @@ def test_prefill_does_not_enter_the_average(pair):
     for stage in (head, tail):
         assert stage._counted == 1
         assert stage._period < 0.3, "время префилла попало в средний шаг"
+
+
+def _run_pipeline(head, tail, steps, *, head_busy, tail_busy, prefill_first=False):
+    """Хвост в своём потоке, голова в этом, как на стенде: голова реально ждёт."""
+    def tail_loop():
+        batch = SimpleNamespace()
+        for _ in range(steps):
+            tail.take(batch)
+            time.sleep(tail_busy)
+            tail.publish(batch, torch.tensor([1], dtype=torch.int32))
+
+    worker = threading.Thread(target=tail_loop)
+    worker.start()
+    batch = SimpleNamespace()
+    for i in range(steps):
+        head.step_started()
+        time.sleep(head_busy)
+        rows = 5 if prefill_first and i == 0 else 1
+        head.give(batch, torch.zeros((rows, 10240), dtype=torch.bfloat16))
+        head.tokens(batch)
+    worker.join(timeout=10)
+
+
+def test_the_head_splits_every_step_into_head_peer_and_wire(pair):
+    """Окно замера рисует токен как голова + хвост + дорога; сумма обязана сойтись.
+
+    Хвост присылает своё время с токеном, голова знает своё, а дорога — остаток
+    её ожидания. Браузер видит только сумму и поделить её не может.
+    """
+    head, tail, relay = pair
+    _run_pipeline(head, tail, 5, head_busy=0.02, tail_busy=0.05)
+
+    rows = head.series_since(0.0)
+    assert len(rows) == 5 and not any(r["prefill"] for r in rows)
+    for previous, row in zip(rows, rows[1:]):
+        assert row["head_ms"] >= 20 and row["peer_ms"] >= 50, row
+        period = 1e3 * (row["end"] - previous["end"])
+        parts = row["head_ms"] + row["peer_ms"] + row["wire_ms"]
+        assert abs(period - parts) < 5, (period, row)
+    assert not tail.series_since(0.0), "ряд пишет только голова"
+
+
+def test_prefill_on_the_head_is_timed_from_the_start_of_its_forward(pair):
+    """Вход префилла у головы приходит не по связи.
+
+    Без начала forward её счёт тянулся бы от последнего токена прошлого
+    запроса, и нулевая точка ряда показала бы простой вместо префилла.
+    """
+    head, tail, relay = pair
+    _run_pipeline(head, tail, 1, head_busy=0.0, tail_busy=0.0)   # прошлый запрос
+    time.sleep(0.3)                                              # простой
+    since = time.time()
+    _run_pipeline(head, tail, 2, head_busy=0.05, tail_busy=0.0, prefill_first=True)
+
+    rows = head.series_since(since)
+    assert [r["prefill"] for r in rows] == [True, False]
+    assert 50 <= rows[0]["head_ms"] < 250, rows[0]
+
+
+def test_the_timings_endpoint_serves_the_steps_since_a_moment(pair):
+    """Посредник забирает ряд по HTTP: он другой процесс, и знает только время."""
+    import json
+    import urllib.request
+
+    head, tail, relay = pair
+    _run_pipeline(head, tail, 2, head_busy=0.0, tail_busy=0.0)
+    since = time.time()
+    _run_pipeline(head, tail, 3, head_busy=0.0, tail_busy=0.0)
+
+    port = head._server.server_address[1]
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/timings?since={since}") as answer:
+        steps = json.loads(answer.read())["steps"]
+    assert len(steps) == 3
+    assert {"end", "head_ms", "peer_ms", "wire_ms", "prefill"} <= set(steps[0])
 
 
 def test_the_seam_stopwatch_can_be_silenced(pair):

@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from freetoken.layers import BaseOP, LinearReplicated, MoELayer, OffloadMoELayer, make_moe_layer
+from freetoken.moe.expert_pieces import bank_layer_of
 from freetoken.utils import nvtx_annotate
 
 if TYPE_CHECKING:
@@ -46,9 +47,13 @@ class GptOssMLP(BaseOP):
                 f"gpt-oss supports only mxfp4 expert weights, got "
                 f"moe_weight_format={config.moe_weight_format!r}"
             )
+        # The offload cache indexes experts by bank: this stage's layers in order.
+        # For the whole model it is the global layer id (no dense prefix here).
+        bank_layer = bank_layer_of(config, layer_id)
+        assert bank_layer is not None, f"layer {layer_id} is built as MoE but has no expert bank"
         self.experts = make_moe_layer(
             config,
-            layer_id=layer_id,
+            layer_id=bank_layer,
             activation="gpt_oss_swiglu",
             alpha=config.hidden_act_alpha,
             limit=config.swiglu_limit,

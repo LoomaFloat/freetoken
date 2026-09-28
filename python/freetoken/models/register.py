@@ -277,6 +277,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.gpt_oss",
         "GptOssForCausalLM",
         packed_modules_mapping=_DENSE_PACKED,
+        supports_stages=True,
     ),
     "Glm4MoeForCausalLM": ModelSpec(
         "freetoken.models.glm4_moe",

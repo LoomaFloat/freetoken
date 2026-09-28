@@ -105,20 +105,22 @@ class HybridSWAKVCache(BaseKVCachePool):
     @staticmethod
     def _build_layers_mapping(
         num_layers: int, specs: dict[str, KVCacheGroupSpec]
-    ) -> tuple[_LayerRef, ...]:
-        mapping: list[_LayerRef | None] = [None] * num_layers
+    ) -> dict[int, _LayerRef]:
+        # Keyed by GLOBAL layer id: a pipeline stage owns a contiguous slice of the
+        # model, so its groups hold only that slice (the whole model is the full range).
+        mapping: dict[int, _LayerRef] = {}
         for group_name in ("full", "swa"):
             for local_index, layer_id in enumerate(specs[group_name].layer_ids):
                 if layer_id < 0 or layer_id >= num_layers:
                     raise ValueError(f"KV layer id {layer_id} is outside [0, {num_layers})")
-                if mapping[layer_id] is not None:
+                if layer_id in mapping:
                     raise ValueError(f"KV layer id {layer_id} appears in more than one group")
                 mapping[layer_id] = _LayerRef(group=group_name, index=local_index)
 
-        missing = [layer_id for layer_id, ref in enumerate(mapping) if ref is None]
+        missing = [i for i in range(min(mapping), max(mapping) + 1) if i not in mapping]
         if missing:
             raise ValueError(f"KV layer ids missing from full/swa groups: {missing}")
-        return tuple(ref for ref in mapping if ref is not None)
+        return mapping
 
     def is_full_layer(self, layer_id: int) -> bool:
         return self.layers_mapping[layer_id].group == "full"

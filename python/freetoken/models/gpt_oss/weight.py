@@ -12,10 +12,15 @@ from freetoken.models.loader import (
     iter_root_safetensor_files_from_index,
     shard_tensor,
 )
+from freetoken.models.stage_weights import stage_keeps, stage_renumber
 from freetoken.utils import cached_load_hf_config
 
 from .config import parse_config
 
+# Pipeline stage edges: embeddings for the first stage only, final norm and
+# lm_head for the last (see ``stage_keeps``).
+_FIRST_ONLY = ("model.embed_tokens",)
+_LAST_ONLY = ("model.norm.", "lm_head")
 _MERGE_RULES = {
     ".q_proj": MergeRule(".qkv_proj", "q", ("q", "k", "v")),
     ".k_proj": MergeRule(".qkv_proj", "k", ("q", "k", "v")),
@@ -212,11 +217,15 @@ def iter_weights(
 ) -> Iterator[tuple[str, torch.Tensor]]:
     config = parse_config(cached_load_hf_config(model_path))
     tp_info = get_tp_info()
+    # Pipeline stage: other stages' layers are not read at all.
+    keep = stage_keeps(config.num_layers, first_only=_FIRST_ONLY, last_only=_LAST_ONLY)
 
     def sharded_tensors() -> Iterator[tuple[str, torch.Tensor]]:
         for file in iter_root_safetensor_files_from_index(model_path):
             with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
                 for raw_name in f.keys():
+                    if keep is not None and not keep(raw_name):
+                        continue
                     is_expert = ".mlp.experts." in raw_name
                     if is_expert and not include_moe_experts:
                         continue
@@ -234,11 +243,19 @@ def iter_weights(
                         intermediate_size=config.moe_intermediate_size,
                     )
 
-    yield from iter_merged_tensors(
+    merged = iter_merged_tensors(
         sharded_tensors(),
         _MERGE_RULES,
         model_name="gpt_oss",
     )
+    # Local layer numbers for the model's state dict only, after merging (quant
+    # schemes are looked up by the checkpoint's own numbers).
+    renumber = stage_renumber(config.num_layers) if include_non_moe else None
+    if renumber is None:
+        yield from merged
+        return
+    for name, tensor in merged:
+        yield renumber(name), tensor
 
 
 def _expert_layer_and_name(key: str) -> tuple[int, str] | None:
@@ -295,13 +312,18 @@ def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bo
         return None
     if config.moe_weight_format != "mxfp4":
         raise ValueError("GPT-OSS offload requires MXFP4 expert weights")
+    from freetoken.moe.expert_pieces import bank_layer_of
+
     tp_info = get_tp_info()
     slices = _source_slices(config, tp_info)
     num_layers, num_experts = config.num_layers, config.num_experts
+    # Checkpoint layer -> bank of THIS stage; other stages' layers are skipped.
+    banks = {layer: bank for layer in config.local_layer_ids
+             if (bank := bank_layer_of(config, layer)) is not None}
 
     def _is_expert(name: str) -> bool:
         info = _expert_layer_and_name(name)
-        return info is not None and 0 <= info[0] < num_layers
+        return info is not None and info[0] in banks
 
     def _tensors():
         if parallel:
@@ -320,6 +342,8 @@ def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bo
                     layer_id, source = info
                     if not 0 <= layer_id < num_layers:
                         raise ValueError(f"Unexpected GPT-OSS expert layer in checkpoint: {name}")
+                    if layer_id not in banks:
+                        continue  # another stage's layer
                     if source not in slices:
                         raise ValueError(f"Unexpected GPT-OSS expert source: {name}")
                     yield name, _read_safetensor_slice(f, name, slices[source][1])
@@ -335,7 +359,7 @@ def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bo
             piece[role] = tensor
             if len(piece) == len(_EXPERT_SOURCES):
                 del pending[layer_id]
-                yield layer_id, 0, num_experts, piece
+                yield banks[layer_id], 0, num_experts, piece
         if pending:
             raise ValueError(f"Missing GPT-OSS expert tensors for layers {sorted(pending)[:8]}")
 

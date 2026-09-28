@@ -37,12 +37,17 @@ class Glm4MoeSparseBlock(BaseOP):
         # the argmax-style top-k selection.
         self.e_score_correction_bias = torch.empty(config.num_experts)
 
-        # The offload cache indexes experts by *MoE* layer (global layer minus
-        # first_k_dense_replace), matching how the loader packs the expert banks. The
-        # per-expert compute is the unified OffloadMoELayer, shared with MiniMax-M2.
+        # The offload cache indexes experts by bank: the MoE layers of THIS stage in order
+        # (global layer minus first_k_dense_replace for a whole model), matching how the
+        # loader packs the expert banks. The per-expert compute is the unified
+        # OffloadMoELayer, shared with MiniMax-M2.
+        from freetoken.moe.expert_pieces import bank_layer_of
+
+        bank_layer = bank_layer_of(config, layer_id)
+        assert bank_layer is not None, f"layer {layer_id} is built as MoE but has no expert bank"
         self.experts = make_moe_layer(
             config,
-            layer_id=layer_id - config.first_k_dense_replace,
+            layer_id=bank_layer,
             renormalize=config.norm_topk_prob,
             quant_config=config.quant,
             prefix=f"{prefix}.experts",

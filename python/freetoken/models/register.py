@@ -282,6 +282,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.glm4_moe",
         "Glm4MoeForCausalLM",
         packed_modules_mapping=_EXPERTS_PACKED,
+        supports_stages=True,
     ),
     # GLM-5.2 (model_type glm_moe_dsa): DeepSeek-V3.2-class MLA + DSA sparse attention
     # with GLM-4-style sigmoid/noaux_tc MoE routing; NVFP4 routed experts served from

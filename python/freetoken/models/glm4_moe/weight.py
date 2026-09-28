@@ -7,8 +7,10 @@ from typing import Iterator
 
 import safetensors
 import torch
-from freetoken.distributed import get_tp_info
+from freetoken.distributed import get_stage_info, get_tp_info
+from freetoken.layers.quantization import QuantKind
 from freetoken.models.loader import drop_page_cache
+from freetoken.moe.expert_pieces import bank_layer_of
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
 )
@@ -28,12 +30,14 @@ _ROUTED_EXPERT_KEY_RE = re.compile(
 _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     key_pattern=_ROUTED_EXPERT_KEY_RE,
     proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
-    layer_to_bank=lambda layer, config: (
-        None
-        if layer < config.first_k_dense_replace or layer >= config.num_layers
-        else layer - config.first_k_dense_replace
-    ),
+    # dense prefix, the MTP layer (index num_layers) and, on a pipeline stage, the other
+    # stages' layers have no bank here
+    layer_to_bank=lambda layer, config: bank_layer_of(config, layer),
     desc="GLM NVFP4 experts",
+)
+# bf16 release (zai-org/GLM-4.5-Air): one plain weight per routed-expert projection.
+_BF16_EXPERT_RE = re.compile(
+    r"^model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\.(?P<proj>gate|up|down)_proj\.weight$"
 )
 
 
@@ -72,6 +76,16 @@ class _ShardReader:
         self._handles.clear()
 
 
+def _iter_resident_linear(
+    reader: _ShardReader, src_prefix: str, dst_prefix: str
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """An always-resident Linear as the checkpoint stores it: NVFP4 (GLM-4.7) or bf16 (GLM-4.5)."""
+    if reader.has(f"{src_prefix}.weight_scale"):
+        yield from _iter_nvfp4_resident(reader, src_prefix, dst_prefix)
+    else:
+        yield f"{dst_prefix}.weight", reader.get(f"{src_prefix}.weight").to(torch.bfloat16)
+
+
 def _iter_nvfp4_resident(
     reader: _ShardReader, src_prefix: str, dst_prefix: str
 ) -> Iterator[tuple[str, torch.Tensor]]:
@@ -92,7 +106,7 @@ def _iter_nvfp4_resident(
 
 
 def _iter_attn_df11(
-    reader: _ShardReader, prefix: str, device: torch.device
+    reader: _ShardReader, prefix: str, device: torch.device, dst: str | None = None
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield DF11 buffers for an attention projection from its bf16 checkpoint weight.
 
@@ -102,7 +116,7 @@ def _iter_attn_df11(
     w = reader.get(f"{prefix}.weight").to(torch.bfloat16)
     bundle = compress_df11_weight(w)
     for name in ("low8", "bitstream", "chunk_start", "lut"):
-        yield f"{prefix}.{name}", bundle[name]
+        yield f"{dst or prefix}.{name}", bundle[name]
 
 
 def iter_weights(
@@ -122,8 +136,8 @@ def iter_weights(
     - MTP layer (index num_layers) and routed experts are skipped.
     """
     assert not include_moe_experts, (
-        "GLM-4 MoE stores experts as NVFP4 and only supports the offload backend; experts "
-        "are loaded into the offload cache from their NVFP4 pieces."
+        "GLM-4 MoE only supports the offload backend; routed experts are loaded into the "
+        "offload cache from their NVFP4 or bf16 pieces (iter_expert_pieces)."
     )
     assert include_non_moe
     config = parse_config(cached_load_hf_config(model_path))
@@ -141,52 +155,56 @@ def iter_weights(
 
 def _iter_resident_weights(reader, config, primary) -> Iterator[tuple[str, torch.Tensor]]:
     device = reader._device
-    L = config.num_layers
     dense = config.first_k_dense_replace
+    # A pipeline stage reads its own layers and edges, numbering its layers from zero (OPList
+    # loads by position). A whole model is the stage 0..num_layers.
+    stage = get_stage_info(config.num_layers)
 
-    for layer in tqdm(range(L), desc="Loading GLM dense weights", disable=not primary):
-        a = f"model.layers.{layer}.self_attn"
+    for layer in tqdm(range(stage.first, stage.last), desc="Loading GLM dense weights", disable=not primary):
+        src_layer = f"model.layers.{layer}"
+        dst_layer = f"model.layers.{layer - stage.first}"
+        a, da = f"{src_layer}.self_attn", f"{dst_layer}.self_attn"
         # DF11 projections (+ qkv bias, bias-free o_proj).
         for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
-            yield from _iter_attn_df11(reader, f"{a}.{proj}", device)
+            yield from _iter_attn_df11(reader, f"{a}.{proj}", device, f"{da}.{proj}")
             bias_name = f"{a}.{proj}.bias"
             if reader.has(bias_name):
-                yield bias_name, reader.get(bias_name).to(torch.bfloat16)
+                yield f"{da}.{proj}.bias", reader.get(bias_name).to(torch.bfloat16)
         for norm in ("q_norm", "k_norm"):
             name = f"{a}.{norm}.weight"
             if reader.has(name):
-                yield name, reader.get(name)
+                yield f"{da}.{norm}.weight", reader.get(name)
         for norm in ("input_layernorm", "post_attention_layernorm"):
-            yield (
-                f"model.layers.{layer}.{norm}.weight",
-                reader.get(f"model.layers.{layer}.{norm}.weight"),
-            )
+            yield f"{dst_layer}.{norm}.weight", reader.get(f"{src_layer}.{norm}.weight")
 
-        m = f"model.layers.{layer}.mlp"
+        m, dm = f"{src_layer}.mlp", f"{dst_layer}.mlp"
         if layer < dense:
-            # dense SwiGLU MLP as native NVFP4, separate gate/up/down.
+            # dense SwiGLU MLP: NVFP4 (GLM-4.7) or bf16 (GLM-4.5), separate gate/up/down.
             for proj in ("gate_proj", "up_proj", "down_proj"):
-                yield from _iter_nvfp4_resident(reader, f"{m}.{proj}", f"{m}.{proj}")
+                yield from _iter_resident_linear(reader, f"{m}.{proj}", f"{dm}.{proj}")
         else:
             # router (bf16 gate + fp32 selection bias -> bf16) and shared expert.
-            yield f"{m}.gate.weight", reader.get(f"{m}.gate.weight")
+            yield f"{dm}.gate.weight", reader.get(f"{m}.gate.weight")
             yield (
-                f"{m}.e_score_correction_bias",
+                f"{dm}.e_score_correction_bias",
                 reader.get(f"{m}.gate.e_score_correction_bias").to(torch.bfloat16),
             )
-            s = f"{m}.shared_experts"
             for proj in ("gate_proj", "up_proj", "down_proj"):
-                yield from _iter_nvfp4_resident(reader, f"{s}.{proj}", f"{s}.{proj}")
+                yield from _iter_resident_linear(
+                    reader, f"{m}.shared_experts.{proj}", f"{dm}.shared_experts.{proj}"
+                )
 
-    # bf16 embedding -> row-contiguous DF11 (~30% smaller), decode only looked-up rows.
-    embed = reader.get("model.embed_tokens.weight").to(torch.bfloat16)
-    for name, buf in compress_df11_embedding(embed).items():
-        yield f"model.embed_tokens.{name}", buf
-    del embed
-    yield "model.norm.weight", reader.get("model.norm.weight")
-    # lm_head stays bf16: full-vocab matmul needs a decode scratch as big as the weight, so
-    # DF11 nets no savings (unlike the gathered embedding lookup).
-    yield "lm_head.weight", reader.get("lm_head.weight")
+    if stage.is_first:
+        # bf16 embedding -> row-contiguous DF11 (~30% smaller), decode only looked-up rows.
+        embed = reader.get("model.embed_tokens.weight").to(torch.bfloat16)
+        for name, buf in compress_df11_embedding(embed).items():
+            yield f"model.embed_tokens.{name}", buf
+        del embed
+    if stage.is_last:
+        yield "model.norm.weight", reader.get("model.norm.weight")
+        # lm_head stays bf16: full-vocab matmul needs a decode scratch as big as the weight, so
+        # DF11 nets no savings (unlike the gathered embedding lookup).
+        yield "lm_head.weight", reader.get("lm_head.weight")
 
 
 # --------------------------------------------------------------------------------------
@@ -196,4 +214,53 @@ def nvfp4_expert_spec(model_path: str, config):
     return _NVFP4_SOURCE_SPEC
 
 
-__all__ = ["iter_weights", "nvfp4_expert_spec"]
+def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | None = False,
+                       workers: int = 8, chunk: int = 8 << 20):
+    """bf16 routed experts (GLM-4.5), one piece per expert: ``{gate, up, down}``; the
+    unquantized bank concatenates gate|up itself. NVFP4 goes through ``nvfp4_expert_spec``."""
+    if kind is not QuantKind.NONE:
+        return None
+    if get_tp_info().size > 1:
+        raise NotImplementedError("glm4_moe bf16 expert banks support TP=1 only")
+    from freetoken.models.weight import experts_scattered, iter_expert_tensors_parallel
+    from freetoken.moe.expert_pieces import per_expert_pieces
+
+    def locate(raw_name: str):
+        m = _BF16_EXPERT_RE.match(raw_name)
+        if m is None:
+            return None
+        bank = bank_layer_of(config, int(m["layer"]))
+        if bank is None:
+            return None
+        return bank, int(m["expert"]), m["proj"]
+
+    if parallel is None:
+        parallel = experts_scattered(model_path)
+    if parallel:
+        # O_DIRECT reads: nothing lands in the page cache next to the banks.
+        tensors = iter_expert_tensors_parallel(
+            model_path, lambda n: locate(n) is not None, workers=workers, chunk=chunk
+        )
+        return per_expert_pieces(tensors, locate, tensors_per_expert=3)
+
+    def _serial():
+        folder = download_hf_weight(model_path)
+        with open(os.path.join(folder, "model.safetensors.index.json")) as f:
+            weight_map = json.load(f)["weight_map"]
+        layers = [lid for lid in config.local_layer_ids if lid >= config.first_k_dense_replace]
+        for layer in tqdm(layers, desc="Loading GLM bf16 experts (serial)", disable=not get_tp_info().is_primary()):
+            reader = _ShardReader(folder, weight_map, torch.device("cpu"))
+            try:
+                for e in range(config.num_experts):
+                    for proj in ("gate", "up", "down"):
+                        name = f"model.layers.{layer}.mlp.experts.{e}.{proj}_proj.weight"
+                        yield name, reader.get(name)
+            finally:
+                # the banks and the checkpoint's page cache do not fit in RAM together:
+                # drop this layer's shards before the next one is read
+                reader.close()
+
+    return per_expert_pieces(_serial(), locate, tensors_per_expert=3)
+
+
+__all__ = ["iter_expert_pieces", "iter_weights", "nvfp4_expert_spec"]

@@ -26,7 +26,7 @@ from freetoken.models.qwen4_exp.config import parse_config
 from freetoken.models.qwen4_exp.weight import iter_weights
 from freetoken.utils import cached_load_hf_config
 
-from .common import QWEN_FP8, hf_config, install_quant_config, meta_state_dict
+from .common import NVIDIA_NVFP4, QWEN_FP8, hf_config, install_quant_config, meta_state_dict
 
 H, E, I = 128, 3, 6
 LAYERS = 4
@@ -360,3 +360,51 @@ def test_fp8_experts_come_from_this_stage_layers(fp8_checkpoint, span, layers, p
     for bank, e, _e1, piece in pieces:
         name = f"{LM}.layers.{layers[bank]}.mlp.experts.{e}.gate_proj.weight"
         assert torch.equal(piece["gate"][0].view(torch.uint8), raw[name].view(torch.uint8))
+
+
+# ------------------------------------------------------------------ nvfp4-эксперты
+
+
+@pytest.fixture(scope="module")
+def nvfp4_checkpoint(tmp_path_factory, checkpoint):
+    """Эксперты по одному в раскладке modelopt, как в nvidia/Qwen3.8-Flash-Next-NVFP4.
+
+    Стенд 2026-09-28: эта модель шла целиком на ноде и падала нулевым рангом
+    конвейера: `bank layer 24 for checkpoint layer 24 is outside [0, 24)`.
+    Спецификация говорила «банк = слой», а у стадии банки свои.
+    """
+    src, _ = checkpoint
+    folder = tmp_path_factory.mktemp("qwen4_exp_stage_nvfp4")
+    raw: dict[str, torch.Tensor] = {}
+    for layer in range(LAYERS):
+        for e in range(E):
+            base = f"{LM}.layers.{layer}.mlp.experts.{e}"
+            for proj, (rows, cols) in (("gate", (I, H)), ("up", (I, H)), ("down", (H, I))):
+                raw[f"{base}.{proj}_proj.weight"] = torch.randint(0, 256, (rows, max(1, cols // 2)), dtype=torch.uint8)
+                raw[f"{base}.{proj}_proj.weight_scale"] = torch.rand(rows, max(1, cols // 16)).to(FP8)
+                raw[f"{base}.{proj}_proj.weight_scale_2"] = torch.rand(()) + 0.5
+    names = sorted(raw)
+    save_file({n: raw[n] for n in names[::2]}, str(folder / "model-nvfp4-00001.safetensors"))
+    save_file({n: raw[n] for n in names[1::2]}, str(folder / "model-nvfp4-00002.safetensors"))
+    cfg = json.loads((__import__("pathlib").Path(src) / "config.json").read_text())
+    cfg["quantization_config"] = NVIDIA_NVFP4
+    (folder / "config.json").write_text(json.dumps(cfg))
+    return str(folder), raw
+
+
+@pytest.mark.parametrize("parallel", [False, True], ids=["serial", "parallel"])
+@pytest.mark.parametrize("span, layers", [("0:2", (0, 1)), ("2:4", (2, 3)), ("", (0, 1, 2, 3))],
+                         ids=["head", "tail", "whole"])
+def test_nvfp4_experts_come_from_this_stage_layers(nvfp4_checkpoint, span, layers, parallel):
+    """Через точку входа движка: банк от стадии, чужие слои не читаются."""
+    from freetoken.moe.expert_pieces import iter_expert_pieces as engine_pieces
+
+    path, raw = nvfp4_checkpoint
+    config = _config(path, span)
+
+    pieces = list(engine_pieces(path, config, QuantKind.NVFP4, parallel=parallel, workers=2))
+
+    assert sorted((p[0], p[1]) for p in pieces) == [(bank, e) for bank in range(len(layers)) for e in range(E)]
+    for bank, e, _e1, piece in pieces:
+        name = f"{LM}.layers.{layers[bank]}.mlp.experts.{e}.up_proj.weight"
+        assert torch.equal(piece["up"][0], raw[name])

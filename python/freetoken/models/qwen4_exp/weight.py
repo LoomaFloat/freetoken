@@ -58,10 +58,18 @@ _EXPERT_RE = re.compile(r"\.mlp\.experts\.(?:\d+\.|(?:gate_up|down)_proj$)")
 # ``model.language_model.`` for the same reason as _EXPERT_KEY_RE: it excludes the MTP
 # head's ``mtp.layers.N.mlp.experts.*``, which this reader drops.
 _STACKED_EXPERT_KEY = "model.language_model.layers.{layer}.mlp.experts.{leaf}"
+def _nvfp4_bank(layer: int, config):
+    # every layer is MoE, so for the whole model the bank is the layer; a pipeline stage
+    # numbers its banks from its first layer and has none for the other stages' layers
+    from freetoken.moe.expert_pieces import bank_layer_of
+
+    return bank_layer_of(config, layer)
+
+
 _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     key_pattern=_EXPERT_KEY_RE,
     proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
-    layer_to_bank=lambda layer, config: layer,  # every layer is MoE
+    layer_to_bank=_nvfp4_bank,
     desc="Qwen3.8-Flash-Next NVFP4 experts",
 )
 # Per-tensor modelopt quant scales; consumed with their ``.weight`` (experts) or unused.

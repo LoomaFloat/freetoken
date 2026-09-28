@@ -72,3 +72,41 @@ def test_fp8_block_moe_epilogues_match_the_reference(activation, alpha, limit):
     # W8A8 prefill quantizes the activations per 128-group, so the tolerance is the fp8 activation error
     assert torch.nn.functional.cosine_similarity(prefill.flatten(), ref.flatten(), dim=0) > 0.99
     assert (prefill - ref).abs().max() <= 8e-2 * ref.abs().max() + 1e-3
+
+
+def _quant_rows(w):
+    """llm-compressor channel fp8: one fp32 scale per output row."""
+    scale = w.float().abs().amax(dim=1).clamp(min=1e-12) / 448.0
+    return (w.float() / scale[:, None]).to(torch.float8_e4m3fn), scale
+
+
+def test_fp8_row_scale_moe_matches_the_reference():
+    """GLM-4.5-Air-FP8: the same GEMMs with one scale per output row, applied after the K-loop."""
+    from freetoken.kernel.triton.fp8_blockscale_moe import fused_experts_decode_fp8_blockscale, fused_experts_fp8_blockscale
+    from freetoken.layers import gated_act_and_mul
+
+    torch.manual_seed(0)
+    gu = [_quant_rows(torch.randn(2 * I, H, device="cuda") / H**0.5) for _ in range(E)]
+    dn = [_quant_rows(torch.randn(H, I, device="cuda") / I**0.5) for _ in range(E)]
+    stack = lambda xs, i: torch.stack([x[i] for x in xs]).contiguous()
+    gate_up, gate_up_scale, down, down_scale = stack(gu, 0), stack(gu, 1), stack(dn, 0), stack(dn, 1)
+    assert not torch.equal(gate_up_scale[0, 0], gate_up_scale[0, 1]), "rows of one 128-block must differ"
+    w, ids = _routing()
+    x = torch.randn(M, H, device="cuda", dtype=torch.bfloat16)
+
+    ref = torch.zeros(M, H, device="cuda", dtype=torch.float32)
+    for e in range(E):
+        g = gate_up[e].float() * gate_up_scale[e][:, None]
+        d = down[e].float() * down_scale[e][:, None]
+        for t, k in zip(*torch.nonzero(ids == e, as_tuple=True)):
+            h = (x[t].float() @ g.T).to(x.dtype).view(1, -1)
+            a = torch.empty(1, I, device="cuda", dtype=x.dtype)
+            gated_act_and_mul("silu", h, a)
+            ref[t] += w[t, k] * (a[0].float() @ d.T)
+
+    decode = fused_experts_decode_fp8_blockscale(x, gate_up, gate_up_scale, down, down_scale, w, ids, per_row_scale=True).float()
+    assert torch.nn.functional.cosine_similarity(decode.flatten(), ref.flatten(), dim=0) > 0.999
+    assert (decode - ref).abs().max() <= 2e-2 * ref.abs().max() + 1e-3
+    prefill = fused_experts_fp8_blockscale(x, gate_up, gate_up_scale, down, down_scale, w, ids, E, per_row_scale=True).float()
+    assert torch.nn.functional.cosine_similarity(prefill.flatten(), ref.flatten(), dim=0) > 0.99
+    assert (prefill - ref).abs().max() <= 8e-2 * ref.abs().max() + 1e-3

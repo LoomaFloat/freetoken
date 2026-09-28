@@ -29,6 +29,7 @@ def legacy_bank_names(quant_format: str) -> dict[str, str]:
 LEGACY_FORMAT = {
     (QuantKind.NONE, "fused"): "bf16",
     (QuantKind.FP8_BLOCK, "triton"): "fp8_block",
+    (QuantKind.FP8_TENSOR, "triton"): "fp8_channel",
     (QuantKind.NVFP4, "triton"): "nvfp4",
     (QuantKind.NVFP4, "marlin"): "nvfp4_marlin",
     (QuantKind.NVFP4, "b12x"): "nvfp4_b12x",

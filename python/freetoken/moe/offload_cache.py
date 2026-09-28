@@ -42,6 +42,9 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # Half the host/cache footprint of bf16; the grouped GEMM (kernel/triton/fp8_blockscale_moe)
     # reads the routed fp8 rows directly and dequantizes in the K-loop (no bf16 materialization).
     "fp8_block": ("gate_up", "gate_up_scale", "down", "down_scale"),
+    # llm-compressor channel fp8 experts (GLM-4.5-Air-FP8): fp8-e4m3 weights + one fp32 scale
+    # per output row, gate_up_scale [L*E, 2I], down_scale [L*E, H]; same grouped GEMMs, per-row mode.
+    "fp8_channel": ("gate_up", "gate_up_scale", "down", "down_scale"),
     # native GGUF Q4_0 experts: packed block bytes per output row, dequantized inside
     # the borrowed ggml MoE kernels. gate_up [L*E, 2I, H//32*18], down [L*E, H, I//32*18].
     "q4_0": ("gate_up", "down"),

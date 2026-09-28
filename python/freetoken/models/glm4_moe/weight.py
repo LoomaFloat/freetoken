@@ -39,6 +39,11 @@ _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
 _BF16_EXPERT_RE = re.compile(
     r"^model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\.(?P<proj>gate|up|down)_proj\.weight$"
 )
+# channel-fp8 release (zai-org/GLM-4.5-Air-FP8, llm-compressor): fp8 weight + fp32 [rows, 1] scale.
+_FP8_EXPERT_RE = re.compile(
+    r"^model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\.(?P<proj>gate|up|down)_proj\.(?P<kind>weight|weight_scale)$"
+)
+_FP8 = torch.float8_e4m3fn
 
 
 # --------------------------------------------------------------------------------------
@@ -79,11 +84,19 @@ class _ShardReader:
 def _iter_resident_linear(
     reader: _ShardReader, src_prefix: str, dst_prefix: str
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """An always-resident Linear as the checkpoint stores it: NVFP4 (GLM-4.7) or bf16 (GLM-4.5)."""
-    if reader.has(f"{src_prefix}.weight_scale"):
+    """An always-resident Linear as the checkpoint stores it: NVFP4 (GLM-4.7), channel fp8
+    (GLM-4.5-Air-FP8) or bf16 (GLM-4.5). Both quantized kinds carry ``weight_scale``; the
+    weight dtype tells them apart."""
+    weight = reader.get(f"{src_prefix}.weight")
+    if weight.dtype == _FP8:
+        # fp8 linear method: [out, in] e4m3 + one fp32 scale per output row
+        yield f"{dst_prefix}.weight", weight
+        scale = reader.get(f"{src_prefix}.weight_scale").to(torch.float32).reshape(-1)
+        yield f"{dst_prefix}.weight_scale", scale.expand(weight.shape[0]).contiguous()
+    elif reader.has(f"{src_prefix}.weight_scale"):
         yield from _iter_nvfp4_resident(reader, src_prefix, dst_prefix)
     else:
-        yield f"{dst_prefix}.weight", reader.get(f"{src_prefix}.weight").to(torch.bfloat16)
+        yield f"{dst_prefix}.weight", weight.to(torch.bfloat16)
 
 
 def _iter_nvfp4_resident(
@@ -111,9 +124,15 @@ def _iter_attn_df11(
     """Yield DF11 buffers for an attention projection from its bf16 checkpoint weight.
 
     qkvo are bf16 in the checkpoint; DF11 compresses them losslessly (~10.7 bits/weight) to
-    fit a 32 GB VRAM target, decoding bit-for-bit.
+    fit a 32 GB VRAM target, decoding bit-for-bit. A channel-fp8 checkpoint (GLM-4.5-Air-FP8)
+    is dequantized first: the attention layers here are bf16-only, and dropping the scale
+    would load the raw e4m3 codes as weights.
     """
-    w = reader.get(f"{prefix}.weight").to(torch.bfloat16)
+    w = reader.get(f"{prefix}.weight")
+    if w.dtype == _FP8:
+        scale = reader.get(f"{prefix}.weight_scale").to(torch.float32).reshape(-1, 1)
+        w = w.to(torch.float32) * scale
+    w = w.to(torch.bfloat16)
     bundle = compress_df11_weight(w)
     for name in ("low8", "bitstream", "chunk_start", "lut"):
         yield f"{dst or prefix}.{name}", bundle[name]
@@ -216,23 +235,30 @@ def nvfp4_expert_spec(model_path: str, config):
 
 def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | None = False,
                        workers: int = 8, chunk: int = 8 << 20):
-    """bf16 routed experts (GLM-4.5), one piece per expert: ``{gate, up, down}``; the
-    unquantized bank concatenates gate|up itself. NVFP4 goes through ``nvfp4_expert_spec``."""
-    if kind is not QuantKind.NONE:
+    """bf16 (GLM-4.5-Air) or channel-fp8 (GLM-4.5-Air-FP8) routed experts, one piece per
+    expert: ``{gate, up, down}`` plus ``{gate,up,down}_scale`` for fp8; the banks concatenate
+    gate|up themselves. NVFP4 goes through ``nvfp4_expert_spec``."""
+    if kind is QuantKind.NONE:
+        key_re, suffixes = _BF16_EXPERT_RE, {"weight": ""}
+    elif kind is QuantKind.FP8_TENSOR:
+        key_re, suffixes = _FP8_EXPERT_RE, {"weight": "", "weight_scale": "_scale"}
+    else:
         return None
     if get_tp_info().size > 1:
-        raise NotImplementedError("glm4_moe bf16 expert banks support TP=1 only")
+        raise NotImplementedError(f"glm4_moe {kind} expert banks support TP=1 only")
     from freetoken.models.weight import experts_scattered, iter_expert_tensors_parallel
     from freetoken.moe.expert_pieces import per_expert_pieces
 
+    per_expert = 3 * len(suffixes)
+
     def locate(raw_name: str):
-        m = _BF16_EXPERT_RE.match(raw_name)
+        m = key_re.match(raw_name)
         if m is None:
             return None
         bank = bank_layer_of(config, int(m["layer"]))
         if bank is None:
             return None
-        return bank, int(m["expert"]), m["proj"]
+        return bank, int(m["expert"]), m["proj"] + suffixes[m.groupdict().get("kind") or "weight"]
 
     if parallel is None:
         parallel = experts_scattered(model_path)
@@ -241,26 +267,27 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | 
         tensors = iter_expert_tensors_parallel(
             model_path, lambda n: locate(n) is not None, workers=workers, chunk=chunk
         )
-        return per_expert_pieces(tensors, locate, tensors_per_expert=3)
+        return per_expert_pieces(tensors, locate, tensors_per_expert=per_expert)
 
     def _serial():
         folder = download_hf_weight(model_path)
         with open(os.path.join(folder, "model.safetensors.index.json")) as f:
             weight_map = json.load(f)["weight_map"]
         layers = [lid for lid in config.local_layer_ids if lid >= config.first_k_dense_replace]
-        for layer in tqdm(layers, desc="Loading GLM bf16 experts (serial)", disable=not get_tp_info().is_primary()):
+        for layer in tqdm(layers, desc=f"Loading GLM {kind} experts (serial)", disable=not get_tp_info().is_primary()):
             reader = _ShardReader(folder, weight_map, torch.device("cpu"))
             try:
                 for e in range(config.num_experts):
                     for proj in ("gate", "up", "down"):
-                        name = f"model.layers.{layer}.mlp.experts.{e}.{proj}_proj.weight"
-                        yield name, reader.get(name)
+                        for leaf in suffixes:
+                            name = f"model.layers.{layer}.mlp.experts.{e}.{proj}_proj.{leaf}"
+                            yield name, reader.get(name)
             finally:
                 # the banks and the checkpoint's page cache do not fit in RAM together:
                 # drop this layer's shards before the next one is read
                 reader.close()
 
-    return per_expert_pieces(_serial(), locate, tensors_per_expert=3)
+    return per_expert_pieces(_serial(), locate, tensors_per_expert=per_expert)
 
 
 __all__ = ["iter_expert_pieces", "iter_weights", "nvfp4_expert_spec"]

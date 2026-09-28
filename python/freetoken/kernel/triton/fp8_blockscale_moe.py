@@ -7,6 +7,10 @@ bf16 GEMM" path it replaces was ~45% of decode GPU time). Activation stays bf16 
 weight-only fp8); for bs=1 decode the GEMM is memory-bound, so reading fp8 weights is the
 win and bf16 compute is free. Structure mirrors ``nvfp4_fused_moe._decode_nvfp4_moe_kernel``
 (route x N-tile grid), with the fp4-LUT dequant swapped for ``fp8 * bf16-block-scale``.
+
+``per_row_scale=True`` takes one fp32 scale per output row instead (llm-compressor
+``strategy: channel``, scales ``[E, N]``): it does not depend on k, so the K-loop sums the
+raw products and the row scale is applied once after it -- exact, no requantization.
 """
 
 from __future__ import annotations
@@ -24,7 +28,7 @@ _TL = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl
 def _decode_fp8_moe_kernel(
     a_ptr,        # [M, K] activation (compute dtype, bf16)
     w_ptr,        # [E, N, K] float8_e4m3fn
-    s_ptr,        # [E, N//128, K//128] bf16 (weight_scale_inv)
+    s_ptr,        # [E, N//128, K//128] bf16 (weight_scale_inv), or [E, N] fp32 per row
     c_ptr,        # [M, TOP_K, N] output
     topk_weights_ptr, topk_ids_ptr,
     total_routes, N, K,
@@ -35,7 +39,7 @@ def _decode_fp8_moe_kernel(
     stride_twm, stride_twk, stride_tidm, stride_tidk,
     BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,  # BLOCK_K == 128 (one weight scale block)
     TOP_K: tl.constexpr, A_ROW_IS_ROUTE: tl.constexpr, MUL_ROUTED_WEIGHT: tl.constexpr,
-    compute_type: tl.constexpr,
+    compute_type: tl.constexpr, SCALE_PER_ROW: tl.constexpr,
 ):
     route_id = tl.program_id(0)
     n_block = tl.program_id(1)
@@ -65,17 +69,27 @@ def _decode_fp8_moe_kernel(
                 w_slot + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
                 mask=n_mask[:, None] & k_mask[None, :], other=0,
             ))
-        sc = tl.load(s_slot + sn * stride_sn + kb * stride_sk, mask=n_mask, other=0.0).to(tl.float32)
         a = tl.load(a_base + offs_k * stride_ak, mask=k_mask, other=0.0).to(tl.float32)
-        acc += tl.sum(w * a[None, :], axis=1) * sc
+        if SCALE_PER_ROW:
+            acc += tl.sum(w * a[None, :], axis=1)
+        else:
+            sc = tl.load(s_slot + sn * stride_sn + kb * stride_sk, mask=n_mask, other=0.0).to(tl.float32)
+            acc += tl.sum(w * a[None, :], axis=1) * sc
 
+    if SCALE_PER_ROW:
+        acc *= tl.load(s_slot + offs_n * stride_sn, mask=n_mask, other=0.0).to(tl.float32)
     if MUL_ROUTED_WEIGHT:
         acc *= tl.load(topk_weights_ptr + token_id * stride_twm + route_k * stride_twk)
     c_ptrs = c_ptr + token_id * stride_cm + route_k * stride_ck + offs_n * stride_cn
     tl.store(c_ptrs, acc.to(compute_type), mask=(route_id < total_routes) & n_mask)
 
 
-def _decode_gemm(a, w, s, c, topk_weights, topk_ids, mul_routed_weight, a_row_is_route):
+def _scale_strides(s, per_row_scale):
+    # per-row scales are [E, N]; the kernel never reads their K stride
+    return (s.stride(0), s.stride(1), 0) if per_row_scale else (s.stride(0), s.stride(1), s.stride(2))
+
+
+def _decode_gemm(a, w, s, c, topk_weights, topk_ids, mul_routed_weight, a_row_is_route, per_row_scale=False):
     M, top_k = topk_ids.shape
     N = w.shape[1]
     total_routes = M * top_k
@@ -87,18 +101,19 @@ def _decode_gemm(a, w, s, c, topk_weights, topk_ids, mul_routed_weight, a_row_is
         a, w, s, c, topk_weights, topk_ids, total_routes, N, w.shape[2],
         a.stride(0), a.stride(1),
         w.stride(0), w.stride(1), w.stride(2),
-        s.stride(0), s.stride(1), s.stride(2),
+        *_scale_strides(s, per_row_scale),
         c.stride(0), c.stride(1), c.stride(2),
         topk_weights.stride(0), topk_weights.stride(1), topk_ids.stride(0), topk_ids.stride(1),
         BLOCK_N=BLOCK_N, BLOCK_K=128, TOP_K=top_k,
         A_ROW_IS_ROUTE=a_row_is_route, MUL_ROUTED_WEIGHT=mul_routed_weight,
-        compute_type=_TL.get(c.dtype, tl.bfloat16), num_warps=4,
+        compute_type=_TL.get(c.dtype, tl.bfloat16), SCALE_PER_ROW=per_row_scale, num_warps=4,
     )
 
 
 def fused_experts_decode_fp8_blockscale(
     hidden_states, gate_up, gate_up_scale, down, down_scale,
     topk_weights, topk_ids, activation="silu", act_alpha=1.0, act_limit=float("inf"),
+    per_row_scale=False,
 ) -> torch.Tensor:
     """Decode (bs-1) inline-dequant block-fp8 MoE. ``topk_ids`` index rows of the expert
     banks (resident: expert id; offload: cache slot)."""
@@ -112,11 +127,11 @@ def fused_experts_decode_fp8_blockscale(
     dev, dt = hidden_states.device, hidden_states.dtype
 
     ic1 = torch.empty((M, top_k, two_i), device=dev, dtype=dt)
-    _decode_gemm(hidden_states, gate_up, gate_up_scale, ic1, topk_weights, topk_ids, False, False)
+    _decode_gemm(hidden_states, gate_up, gate_up_scale, ic1, topk_weights, topk_ids, False, False, per_row_scale)
     ic2 = torch.empty((M * top_k, inter), device=dev, dtype=dt)
     gated_act_and_mul(activation, ic1.view(-1, two_i), ic2, alpha=act_alpha, limit=act_limit)
     ic3 = torch.empty((M, top_k, H), device=dev, dtype=dt)
-    _decode_gemm(ic2, down, down_scale, ic3, topk_weights, topk_ids, True, True)
+    _decode_gemm(ic2, down, down_scale, ic3, topk_weights, topk_ids, True, True, per_row_scale)
     out = torch.empty_like(hidden_states)
     moe_sum_reduce_triton(ic3, out)
     return out
@@ -141,7 +156,7 @@ def _prefill_fp8_moe_kernel(
     stride_tw,
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr, MUL_ROUTED_WEIGHT: tl.constexpr, top_k: tl.constexpr,
-    compute_type: tl.constexpr,
+    compute_type: tl.constexpr, SCALE_PER_ROW: tl.constexpr,
 ):
     """W8A8: ``a`` is fp8 (per-128-K-group act scale ``a_scale``), ``w`` fp8 (per-128x128
     block scale ``s``); ``tl.dot`` runs on fp8 tensor cores, both scales applied per K-block."""
@@ -168,7 +183,7 @@ def _prefill_fp8_moe_kernel(
     a_ptrs = a_ptr + (a_rows[:, None] * stride_am + offs_k[None, :] * stride_ak)
     slot = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
     w_base = w_ptr + slot * stride_we + offs_bn[None, :] * stride_wn
-    sn = pid_n  # BLOCK_SIZE_N == 128 -> one weight-scale N-block per tile
+    sn = pid_n  # BLOCK_SIZE_N == 128 -> one weight-scale N-block per tile (block scales only)
     s_base = s_ptr + slot * stride_se + sn * stride_sn
     as_base = a_scale_ptr + a_rows * stride_asm  # per-token act scale, indexed per K-block
 
@@ -181,12 +196,18 @@ def _prefill_fp8_moe_kernel(
             w = tl.load(w_base + offs_k[:, None] * stride_wk, mask=w_mask, other=0.0)  # fp8
         else:
             w = e4m3_u8_to_f32(tl.load(w_base + offs_k[:, None] * stride_wk, mask=w_mask, other=0)).to(tl.bfloat16)
-        wsc = tl.load(s_base + kb * stride_sk).to(tl.float32)
         asc = tl.load(as_base + kb * stride_ask, mask=token_mask, other=0.0).to(tl.float32)
-        acc += tl.dot(a, w) * asc[:, None] * wsc
+        if SCALE_PER_ROW:
+            acc += tl.dot(a, w) * asc[:, None]
+        else:
+            wsc = tl.load(s_base + kb * stride_sk).to(tl.float32)
+            acc += tl.dot(a, w) * asc[:, None] * wsc
         a_ptrs += BLOCK_SIZE_K * stride_ak
         w_base += BLOCK_SIZE_K * stride_wk
 
+    if SCALE_PER_ROW:
+        # offs_bn wraps modulo N, so every lane reads a real row
+        acc *= tl.load(s_ptr + slot * stride_se + offs_bn * stride_sn).to(tl.float32)[None, :]
     if MUL_ROUTED_WEIGHT:
         mw = tl.load(topk_weights_ptr + offs_token * stride_tw, mask=token_mask, other=0.0)
         acc = acc * mw[:, None]
@@ -197,7 +218,7 @@ def _prefill_fp8_moe_kernel(
 
 
 def _prefill_gemm(a_fp8, a_scale, w, s, c, tw, sorted_ids, expert_ids, ntpp, num_valid,
-                  kernel_top_k, mul_routed_weight, cfg):
+                  kernel_top_k, mul_routed_weight, cfg, per_row_scale=False):
     N, K = w.shape[1], w.shape[2]
     EM = sorted_ids.shape[0]
     w = e4m3_kernel_view(w)
@@ -206,17 +227,18 @@ def _prefill_gemm(a_fp8, a_scale, w, s, c, tw, sorted_ids, expert_ids, ntpp, num
         a_fp8, w, s, c, tw, sorted_ids, expert_ids, ntpp, a_scale, N, K, EM, num_valid,
         a_fp8.stride(0), a_fp8.stride(1),
         w.stride(0), w.stride(1), w.stride(2),
-        s.stride(0), s.stride(1), s.stride(2),
+        *_scale_strides(s, per_row_scale),
         a_scale.stride(0), a_scale.stride(1),
         c.stride(1), c.stride(2), tw.stride(0),
         MUL_ROUTED_WEIGHT=mul_routed_weight, top_k=kernel_top_k,
-        compute_type=_TL.get(c.dtype, tl.bfloat16), **cfg,
+        compute_type=_TL.get(c.dtype, tl.bfloat16), SCALE_PER_ROW=per_row_scale, **cfg,
     )
 
 
 def fused_experts_fp8_blockscale(
     hidden_states, gate_up, gate_up_scale, down, down_scale,
     topk_weights, topk_ids, num_experts, activation="silu", act_alpha=1.0, act_limit=float("inf"),
+    per_row_scale=False,
 ) -> torch.Tensor:
     """Prefill inline-dequant block-fp8 MoE. ``topk_ids`` index expert rows in [0, num_experts)
     (materialized layer: position == expert id)."""
@@ -242,13 +264,13 @@ def fused_experts_fp8_blockscale(
     a1_fp8, a1_scale = per_token_group_quant_fp8(hidden_states, 128)
     ic1 = torch.empty((M, top_k, two_i), device=dev, dtype=dt)
     _prefill_gemm(a1_fp8, a1_scale, gate_up, gate_up_scale, ic1, tw, sorted_ids, expert_ids, ntpp,
-                  num_valid, top_k, False, cfg)
+                  num_valid, top_k, False, cfg, per_row_scale)
     ic2 = torch.empty((M * top_k, inter), device=dev, dtype=dt)
     gated_act_and_mul(activation, ic1.view(-1, two_i), ic2, alpha=act_alpha, limit=act_limit)
     a2_fp8, a2_scale = per_token_group_quant_fp8(ic2, 128)
     ic3 = torch.empty((M, top_k, H), device=dev, dtype=dt)
     _prefill_gemm(a2_fp8, a2_scale, down, down_scale, ic3, tw, sorted_ids, expert_ids, ntpp,
-                  num_valid, 1, True, cfg)
+                  num_valid, 1, True, cfg, per_row_scale)
     out = torch.empty_like(hidden_states)
     moe_sum_reduce_triton(ic3, out)
     return out

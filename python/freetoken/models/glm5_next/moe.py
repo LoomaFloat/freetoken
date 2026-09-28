@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Tuple
 import torch
 import torch.nn.functional as F
 from freetoken.layers import BaseOP, LinearReplicated, make_moe_layer
+from freetoken.moe.expert_pieces import bank_layer_of
 
 from .mlp import Glm5NextGatedMLP
 
@@ -38,10 +39,13 @@ class Glm5NextSparseBlock(BaseOP):
         self.gate = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)
         self.e_score_correction_bias = torch.empty(config.num_experts, dtype=torch.float32)
 
-        # The offload cache indexes experts by MoE layer (global minus dense prefix).
+        # The offload cache indexes experts by bank: MoE layers of THIS stage in order
+        # (global minus dense prefix for the whole model).
+        bank_layer = bank_layer_of(config, layer_id)
+        assert bank_layer is not None, f"layer {layer_id} is built as MoE but has no expert bank"
         self.experts = make_moe_layer(
             config,
-            layer_id=layer_id - config.first_k_dense_replace,
+            layer_id=bank_layer,
             activation="swiglu_clamp" if config.swiglu_limit is not None else "silu",
             renormalize=config.norm_topk_prob,
             limit=config.swiglu_limit,

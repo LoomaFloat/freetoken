@@ -139,35 +139,121 @@ class Glm5NextDecoderLayer(BaseOP):
 
 class Glm5NextModel(BaseOP):
     def __init__(self, config: ModelConfig, *, prefix: str = "model"):
-        self.embed_tokens = VocabParallelEmbedding(
-            num_embeddings=config.vocab_size,
-            embedding_dim=config.hidden_size,
+        # Стадия конвейера строит только свои слои, а края — тем, кому они
+        # достались: эмбеддинги первой, финальную норму последней. Без отрезка
+        # всё это есть, и модель собирается ровно как раньше.
+        whole = config.owns_first_layer and config.owns_last_layer
+        if not whole and not config.glm5_args.mhc:
+            raise ValueError("стадия конвейера glm5_next рассчитана на остаток mHC (hc_mult > 1)")
+        self._n = config.glm5_args.mhc_num_residual_streams
+        self._hidden = config.hidden_size
+        # x и потоки остатка едут через шов во fp32 и возвращаются в тип модели;
+        # модель строят под torch_dtype движка, он же и тип по умолчанию здесь.
+        self._dtype = torch.get_default_dtype()
+        self.embed_tokens = (
+            VocabParallelEmbedding(
+                num_embeddings=config.vocab_size,
+                embedding_dim=config.hidden_size,
+            )
+            if config.owns_first_layer
+            else None
         )
         self.layers = OPList(
-            [Glm5NextDecoderLayer(config, i, prefix=f"{prefix}.layers.{i}") for i in range(config.num_layers)]
+            [Glm5NextDecoderLayer(config, i, prefix=f"{prefix}.layers.{i}") for i in config.local_layer_ids]
         )
-        self.norm = RMSNorm(size=config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = (
+            RMSNorm(size=config.hidden_size, eps=config.rms_norm_eps)
+            if config.owns_last_layer
+            else None
+        )
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        x = embed_input_ids(self.embed_tokens, input_ids, get_global_ctx().batch)
+    @property
+    def stream_width(self) -> int:
+        """Ширина остатка на шве: x, n потоков, post и comb (см. `_pack`)."""
+        n, h = self._n, self._hidden
+        return h + n * h + n + n * n
+
+    def _pack(self, x, residual, post, comb) -> torch.Tensor:
+        """Отложенное состояние mHC на границе слоёв -> один тензор fp32.
+
+        Едет вся четвёрка, а не применённый к остатку post. Следующий слой
+        складывает post с pre в одном ядре, и с тем же состоянием на входе
+        хвост посчитает ровно то, что посчитала бы целая модель, как бы ядро ни
+        округляло внутри. bf16 -> fp32 -> bf16 без потерь; post и comb и так fp32.
+        """
+        t = x.shape[0]
+        return torch.cat(
+            (x.float(), residual.reshape(t, -1).float(),
+             post.reshape(t, -1).float(), comb.reshape(t, -1).float()),
+            dim=-1,
+        )
+
+    def _unpack(self, hidden: torch.Tensor):
+        n, h, t = self._n, self._hidden, hidden.shape[0]
+        x, residual, post, comb = hidden.split((h, n * h, n, n * n), dim=-1)
+        return (
+            x.to(self._dtype).contiguous(),
+            residual.reshape(t, n, h).to(self._dtype).contiguous(),
+            post.reshape(t, n, 1).to(torch.float32).contiguous(),
+            comb.reshape(t, n, n).to(torch.float32).contiguous(),
+        )
+
+    def forward(self, input_ids: torch.Tensor, hidden: torch.Tensor | None = None) -> torch.Tensor:
+        """Свои слои. ``hidden`` — состояние предыдущей стадии (см. `_pack`)."""
         residual = post = comb = None
+        if hidden is None:
+            if self.embed_tokens is None:
+                raise ValueError(
+                    "стадия без эмбеддингов не получила остаток предыдущей: "
+                    "его кладут в batch.stage_hidden, и считать без него нечего"
+                )
+            x = embed_input_ids(self.embed_tokens, input_ids, get_global_ctx().batch)
+        elif hidden.shape[-1] != self.stream_width:
+            raise ValueError(
+                f"остаток шириной {hidden.shape[-1]}, ожидалось {self.stream_width} "
+                f"(x, {self._n} потоков mHC, post и comb)"
+            )
+        else:
+            x, residual, post, comb = self._unpack(hidden)
         for layer in self.layers.op_list:
             x, residual, post, comb = layer.forward(x, residual, post, comb)
+        if self.norm is None:
+            return self._pack(x, residual, post, comb)
         return self.norm.forward(x)
 
 
 class Glm5NextForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig):
+        if config.tie_word_embeddings and config.owns_last_layer and not config.owns_first_layer:
+            # lm_head берёт веса у эмбеддингов, а они на первой стадии.
+            raise ValueError(
+                "связанные эмбеддинги (tie_word_embeddings) на конвейере не поддержаны: "
+                "lm_head последней стадии берёт веса у эмбеддингов первой"
+            )
         self._config = config
         self.model = Glm5NextModel(config)
-        self.lm_head = ParallelLMHead(
-            num_embeddings=config.vocab_size,
-            embedding_dim=config.hidden_size,
-            tie_word_embeddings=config.tie_word_embeddings,
-            tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
-            quant_config=config.quant,
-            prefix="lm_head",
+        self.lm_head = (
+            ParallelLMHead(
+                num_embeddings=config.vocab_size,
+                embedding_dim=config.hidden_size,
+                tie_word_embeddings=config.tie_word_embeddings,
+                tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
+                quant_config=config.quant,
+                prefix="lm_head",
+            )
+            if config.owns_last_layer
+            else None
         )
+
+    @property
+    def stage_input_width(self) -> int:
+        """Ширина остатка на входе. Ноль у первой стадии и у целой модели."""
+        return 0 if self.model.embed_tokens is not None else self.model.stream_width
+
+    @property
+    def produces_logits(self) -> bool:
+        """Логиты есть только у последней стадии; остальные отдают остаток."""
+        return self.lm_head is not None
 
     def prepare_for_runtime(self) -> None:
         """Post-load, pre-KV-sizing hook: materialize the DSA layers' bmm-ready
@@ -179,7 +265,11 @@ class Glm5NextForCausalLM(BaseLLMModel):
         torch.cuda.empty_cache()
 
     def forward(self) -> torch.Tensor:
-        output = self.model.forward(get_global_ctx().batch.input_ids)
+        batch = get_global_ctx().batch
+        hidden = getattr(batch, "stage_hidden", None)
+        output = self.model.forward(batch.input_ids, hidden=hidden)
+        if self.lm_head is None:
+            return output
         return self.lm_head.forward(output)
 
 

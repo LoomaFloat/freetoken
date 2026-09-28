@@ -28,7 +28,7 @@ import re
 from typing import Iterator
 
 import torch
-from freetoken.distributed import get_tp_info
+from freetoken.distributed import get_stage_info, get_tp_info
 from freetoken.layers.quantization import QuantKind
 from freetoken.models.glm_moe_dsa.weight import _ShardReader
 from freetoken.models.loader import drop_page_cache
@@ -46,13 +46,12 @@ _CKPT = "model.language_model"
 _MODEL = "model"
 
 # MTP-layer experts (layer == num_layers under the full checkpoint) map to None
-# alongside the dense prefix; the bank loader skips them.
+# alongside the dense prefix and, on a pipeline stage, the other stages' layers; the
+# bank loader skips them.
 def _layer_to_bank(layer, config):
-    return (
-        None
-        if layer < config.first_k_dense_replace or layer >= config.num_layers
-        else layer - config.first_k_dense_replace
-    )
+    from freetoken.moe.expert_pieces import bank_layer_of
+
+    return bank_layer_of(config, layer)
 
 
 # ModelOpt export (LibertAIDAI/GLM-5.3-Flash-NVFP4): weight | weight_scale |
@@ -115,9 +114,9 @@ def nvfp4_expert_spec(model_path: str, config) -> Nvfp4ExpertSourceSpec:
     return _select_expert_source_spec(model_path)
 
 
-def _iter_kda_layer(reader, layer: int) -> Iterator[tuple[str, torch.Tensor]]:
+def _iter_kda_layer(reader, layer: int, local: int) -> Iterator[tuple[str, torch.Tensor]]:
     src = f"{_CKPT}.layers.{layer}.self_attn"
-    dst = f"{_MODEL}.layers.{layer}.self_attn"
+    dst = f"{_MODEL}.layers.{local}.self_attn"
     # One fused input GEMM: q|k|v|b|f_a|g_a (output-axis concat).
     parts = [reader.get(f"{src}.{p}.weight") for p in _KDA_IN_PROJ]
     if any(p.dtype == torch.float8_e4m3fn for p in parts):
@@ -137,9 +136,9 @@ def _iter_kda_layer(reader, layer: int) -> Iterator[tuple[str, torch.Tensor]]:
     yield f"{dst}.o_norm.weight", reader.get(f"{src}.o_norm.weight").to(torch.bfloat16)
 
 
-def _iter_dsa_layer(reader, layer: int) -> Iterator[tuple[str, torch.Tensor]]:
+def _iter_dsa_layer(reader, layer: int, local: int) -> Iterator[tuple[str, torch.Tensor]]:
     src = f"{_CKPT}.layers.{layer}.self_attn"
-    dst = f"{_MODEL}.layers.{layer}.self_attn"
+    dst = f"{_MODEL}.layers.{local}.self_attn"
     for proj in ("q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj"):
         yield from _proj(reader, f"{src}.{proj}", f"{dst}.{proj}")
     for norm in ("q_a_layernorm", "kv_a_layernorm"):
@@ -188,18 +187,22 @@ def iter_weights(
         weight_map = json.load(f)["weight_map"]
     reader = _ShardReader(folder, weight_map, device)
     primary = get_tp_info().is_primary()
+    # A pipeline stage reads its own layers and edges only, and numbers its layers from
+    # zero: OPList loads by position, while quant lookups used the checkpoint number at
+    # build time. A whole model is the stage 0..num_layers.
+    stage = get_stage_info(config.num_layers)
     try:
         for layer in tqdm(
-            range(config.num_layers),
+            range(stage.first, stage.last),
             desc="Loading GLM-5.3 dense weights",
             disable=not primary,
         ):
             src = f"{_CKPT}.layers.{layer}"
-            dst = f"{_MODEL}.layers.{layer}"
+            dst = f"{_MODEL}.layers.{layer - stage.first}"
             if args.is_kda_layer(layer):
-                yield from _iter_kda_layer(reader, layer)
+                yield from _iter_kda_layer(reader, layer, layer - stage.first)
             else:
-                yield from _iter_dsa_layer(reader, layer)
+                yield from _iter_dsa_layer(reader, layer, layer - stage.first)
 
             # mHC mixing tensors, fp32 on every layer.
             for hc in ("hc_attn_fn", "hc_attn_base", "hc_attn_scale",
@@ -227,12 +230,14 @@ def iter_weights(
                 for proj in ("gate_proj", "up_proj", "down_proj"):
                     yield from _proj(reader, f"{src}.mlp.shared_experts.{proj}", f"{dst}.mlp.shared_experts.{proj}")
 
-        yield f"{_MODEL}.embed_tokens.weight", reader.get(
-            f"{_CKPT}.embed_tokens.weight"
-        ).to(torch.bfloat16)
-        yield f"{_MODEL}.norm.weight", reader.get(f"{_CKPT}.norm.weight").to(torch.bfloat16)
-        yield "lm_head.weight", reader.get("lm_head.weight").to(torch.bfloat16)
-        if include_vision:
+        if stage.is_first:
+            yield f"{_MODEL}.embed_tokens.weight", reader.get(
+                f"{_CKPT}.embed_tokens.weight"
+            ).to(torch.bfloat16)
+        if stage.is_last:
+            yield f"{_MODEL}.norm.weight", reader.get(f"{_CKPT}.norm.weight").to(torch.bfloat16)
+            yield "lm_head.weight", reader.get("lm_head.weight").to(torch.bfloat16)
+        if include_vision and stage.is_first:
             yield from _iter_vision(reader, weight_map)
     finally:
         reader.close()
@@ -284,7 +289,7 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | 
             weight_map = json.load(f)["weight_map"]
         reader = _ShardReader(folder, weight_map, torch.device("cpu"))
         try:
-            layers = range(config.first_k_dense_replace, config.num_layers)
+            layers = [lid for lid in config.local_layer_ids if lid >= config.first_k_dense_replace]
             for layer in tqdm(layers, desc="Loading GLM-5.3 fp8 experts (serial)", disable=not get_tp_info().is_primary()):
                 for e in range(config.num_experts):
                     base = f"{_CKPT}.layers.{layer}.mlp.experts.{e}"

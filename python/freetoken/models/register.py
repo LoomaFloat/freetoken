@@ -303,6 +303,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         packed_modules_mapping=_GLM5_NEXT_PACKED,
         mm_processor=_GLM5_NEXT_PROCESSOR,
         encoders=_GLM5_NEXT_ENCODERS,
+        supports_stages=True,
     ),
     # Text-only sibling (the text_config's own architectures entry).
     "Glm5NextForCausalLM": ModelSpec(

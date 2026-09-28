@@ -79,8 +79,20 @@ def test_text_model_only_hands_the_parser_a_config_without_vision(monkeypatch):
 
 
 @pytest.fixture
-def stage():
-    """Отрезок слоёв — настройка окружающая, между тестами она течёт."""
+def stage(monkeypatch):
+    """Отрезок слоёв — настройка окружающая, между тестами она течёт.
+
+    Гейт башни — общий механизм `EngineConfig`, и проверяется он на Qwen-VL как
+    на семействе с башней. Сам Qwen-VL стадию не объявляет, и движок ему
+    отказывает (это проверено отдельно), поэтому здесь флаг поднят подменой.
+    """
+    from dataclasses import replace
+
+    import freetoken.engine.config as engine_config
+
+    real = engine_config.get_model_spec
+    monkeypatch.setattr(engine_config, "get_model_spec",
+                        lambda arch: replace(real(arch), supports_stages=True))
     clear_stage_info()
     yield
     clear_stage_info()

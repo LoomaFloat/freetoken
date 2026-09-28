@@ -60,6 +60,39 @@ def test_small_cache_disables_prefill_overlap():
     assert size == 12
 
 
+def test_a_budget_under_two_layers_drops_prefill_overlap():
+    # Stand 2026-09-28, bf16 Qwen3.8-Flash-Next on one 24 GB card: 1024 slots (two full
+    # layers) + the KV floor needed 10.27 GB of a 9.09 GB budget, and the boot refused.
+    per_expert, per_page = 9_830_400, 1_622_784
+    size, pages, overlap = plan_cache_budget(
+        budget_bytes=9_090_974_520, per_expert_bytes=per_expert, cache_per_page=per_page,
+        num_experts=512, total_experts=48 * 512, prefill_overlap=True,
+        kv_reserve_pages=128, max_slots=48 * 512,
+    )
+    assert overlap is False
+    assert size == (9_090_974_520 - 128 * per_page) // per_expert  # == 903, above one layer
+    assert pages >= 128 and size * per_expert + pages * per_page <= 9_090_974_520
+
+
+def test_prefill_overlap_stays_when_two_layers_fit_exactly():
+    size, pages, overlap = plan_cache_budget(
+        budget_bytes=8 * 100 + 5 * 10, per_expert_bytes=100, cache_per_page=10,
+        num_experts=4, total_experts=40, prefill_overlap=True,
+        kv_reserve_pages=5, max_slots=40,
+    )
+    assert overlap is True and size == 8 and pages == 5
+
+
+def test_a_budget_under_one_layer_still_refuses():
+    # Dropping overlap lowers the floor to one layer; below that there is no plan.
+    with pytest.raises(AssertionError, match="budget too small"):
+        plan_cache_budget(
+            budget_bytes=3 * 100 + 5 * 10, per_expert_bytes=100, cache_per_page=10,
+            num_experts=4, total_experts=40, prefill_overlap=True,
+            kv_reserve_pages=5, max_slots=40,
+        )
+
+
 def test_insufficient_kv_memory_raises():
     with pytest.raises(AssertionError, match="not enough memory"):
         plan_cache_budget(

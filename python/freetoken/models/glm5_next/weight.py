@@ -101,11 +101,21 @@ _FP8_EXPERT_RE = re.compile(
 
 
 def _proj(reader, src: str, dst: str) -> Iterator[tuple[str, torch.Tensor]]:
-    """One projection as the checkpoint stores it: bf16, or fp8 codes with their block scales."""
+    """One projection as the checkpoint stores it: bf16, fp8 codes with their block scales,
+    or ModelOpt NVFP4 (nvidia/GLM-5.3-Flash-NVFP4 quantizes the dense-prefix MLP too)."""
     w = reader.get(f"{src}.weight")
     if w.dtype == torch.float8_e4m3fn:
         yield f"{dst}.weight", w
         yield f"{dst}.weight_scale_inv", reader.get(f"{src}.weight_scale_inv")
+    elif w.dtype == torch.uint8 and reader.has(f"{src}.weight_scale_2"):
+        # packed e2m1 codes + fp8 per-16 block scales verbatim; the dequant-side per-tensor
+        # weight_scale_2 becomes the linear's per-row fp16 weight_global
+        yield f"{dst}.weight", w
+        yield f"{dst}.weight_scale", reader.get(f"{src}.weight_scale")
+        g = reader.get(f"{src}.weight_scale_2").reshape(()).to(torch.float16)
+        yield f"{dst}.weight_global", g.expand(w.shape[0]).contiguous()
+        if reader.has(f"{src}.input_scale"):
+            yield f"{dst}.input_scale", reader.get(f"{src}.input_scale").reshape(()).to(torch.float32)
     else:
         yield f"{dst}.weight", w.to(torch.bfloat16)
 

@@ -8,7 +8,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from freetoken.utils import div_ceil
+from freetoken.utils import div_ceil, init_logger
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     import torch
@@ -108,6 +110,7 @@ def resolve_moe_cache_auto(
     kv_reserve_tokens: int,
     page_size: int,
     max_slots: int | None = None,
+    kv_reserve_min_tokens: int | None = None,
 ) -> tuple[int, int, bool]:
     """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
 
@@ -116,17 +119,36 @@ def resolve_moe_cache_auto(
     Applies memory_ratio to the persisted pre-model baseline exactly once, then defers
     the MoE-vs-KV split to plan_cache_budget. The (1-memory_ratio) remainder is the
     CUDA-graph/activation headroom (not subtracted here).
+
+    ``kv_reserve_min_tokens`` turns the reserve into a target: when it does not fit next to
+    the minimum expert cache, it is halved down to that floor before giving up. This runs
+    after the expert banks are loaded, so falling back here is free, while refusing means
+    a full restart.
     """
     budget_bytes = net_cache_budget_bytes(memory_ratio, baseline_free, weights_bytes, fixed_cache_size)
     max_slots = total_experts if max_slots is None else min(max_slots, total_experts)
-    kv_reserve_pages = div_ceil(kv_reserve_tokens, page_size)
-    return plan_cache_budget(
-        budget_bytes=budget_bytes,
-        per_expert_bytes=per_expert_bytes,
-        cache_per_page=cache_per_page,
-        num_experts=num_experts,
-        total_experts=total_experts,
-        prefill_overlap=prefill_overlap,
-        kv_reserve_pages=kv_reserve_pages,
-        max_slots=max_slots,
-    )
+    floor = kv_reserve_tokens if kv_reserve_min_tokens is None else min(kv_reserve_min_tokens, kv_reserve_tokens)
+    reserve = kv_reserve_tokens
+    while True:
+        try:
+            plan = plan_cache_budget(
+                budget_bytes=budget_bytes,
+                per_expert_bytes=per_expert_bytes,
+                cache_per_page=cache_per_page,
+                num_experts=num_experts,
+                total_experts=total_experts,
+                prefill_overlap=prefill_overlap,
+                kv_reserve_pages=div_ceil(reserve, page_size),
+                max_slots=max_slots,
+            )
+        except AssertionError:
+            if reserve <= floor:
+                raise
+            reserve = max(floor, reserve // 2)
+            continue
+        if reserve < kv_reserve_tokens:
+            logger.warning(
+                f"KV reserve {kv_reserve_tokens} tokens does not fit next to the minimum expert "
+                f"cache; kept {reserve} (floor {floor})"
+            )
+        return plan

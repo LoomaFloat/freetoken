@@ -703,6 +703,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-reserve-min-tokens",
+        type=int,
+        default=ServerArgs.kv_reserve_min_tokens,
+        help=(
+            "If --kv-reserve-tokens does not fit next to the minimum expert cache, halve it "
+            "down to this floor instead of refusing to start (the log says what was kept)."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-cache-policy",
         default=ServerArgs.moe_cache_policy,
         choices=["lru"],

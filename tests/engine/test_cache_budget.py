@@ -536,3 +536,34 @@ def test_uncapped_platform_stays_uncapped(monkeypatch):
     if hasattr(os, "uname") and "microsoft" in os.uname().release.lower():
         pytest.skip("WSL caps pinning")
     assert _pin_budget_bytes(reserved=2**30) is None
+
+
+# --kv-reserve-min-tokens: the reserve is a target that falls back instead of refusing.
+# budget 1000, per_expert 100, num_experts 4 (min slots 4 = 400 B), 10 B per page of 1 token.
+_FALLBACK = dict(
+    baseline_free=1000, weights_bytes=0, memory_ratio=1.0, cache_per_page=10, fixed_cache_size=0,
+    per_expert_bytes=100, num_experts=4, total_experts=8, prefill_overlap=False, page_size=1,
+)
+
+
+def test_reserve_that_fits_is_kept_as_is():
+    size, pages, _ = resolve_moe_cache_auto(**_FALLBACK, kv_reserve_tokens=40, kv_reserve_min_tokens=8)
+    # experts take (1000 - 400) // 100 = 6 slots; 400 B left -> 40 pages
+    assert (size, pages) == (6, 40)
+
+
+def test_reserve_too_big_is_halved_down_to_what_fits():
+    # 64 pages (640 B) + 4 min slots (400 B) > 1000; 32 pages fit -> 6 slots? (1000-320)//100=6
+    size, pages, _ = resolve_moe_cache_auto(**_FALLBACK, kv_reserve_tokens=64, kv_reserve_min_tokens=8)
+    assert pages >= 32 and size >= 4
+    assert size * 100 + pages * 10 <= 1000
+
+
+def test_without_floor_the_reserve_is_still_a_hard_floor():
+    with pytest.raises(AssertionError, match="budget too small"):
+        resolve_moe_cache_auto(**_FALLBACK, kv_reserve_tokens=64)
+
+
+def test_fallback_stops_at_the_floor():
+    with pytest.raises(AssertionError, match="budget too small"):
+        resolve_moe_cache_auto(**_FALLBACK, kv_reserve_tokens=640, kv_reserve_min_tokens=70)

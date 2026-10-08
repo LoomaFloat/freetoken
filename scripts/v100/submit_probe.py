@@ -38,7 +38,8 @@ def requirements(tag: str, version: str) -> list[str]:
         f"{TORCH}torch-2.11.0%2Bcu126-cp312-cp312-manylinux_2_28_x86_64.whl",
         f"{TORCH}torchvision-0.26.0%2Bcu126-cp312-cp312-manylinux_2_28_x86_64.whl",
         f"freetoken @ {base}freetoken-0.1.3%2B{local}-cp312-cp312-linux_x86_64.whl",
-        f"{base}freetoken_kernel_cache-0.1.3%2Bcu126.{local}-py3-none-linux_x86_64.whl",
+        f"{RELEASE.format(tag='v0.1.3-looma25-v100.1')}"
+        "freetoken_kernel_cache-0.1.3%2Bcu126.looma25.v100.1-py3-none-linux_x86_64.whl",
         "ziglang==0.16.0",
         "pytest>=8,<9",
     ]
@@ -112,7 +113,7 @@ def main() -> None:
     sub = parser.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("submit")
     s.add_argument("--node", default="")
-    s.add_argument("--tag", default="v0.1.3-looma25-v100.1")
+    s.add_argument("--tag", default="v0.1.3-looma25-v100.2")
     s.add_argument("--cpus", type=float, default=16)
     s.add_argument("--hours", type=float, default=4)
     s.add_argument("probe_args", nargs=argparse.REMAINDER)

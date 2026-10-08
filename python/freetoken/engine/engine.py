@@ -75,6 +75,24 @@ def _startup_kv_budget(memory_ratio: float, init_free_memory: int, new_free_memo
     return int(memory_ratio * init_free_memory) - (init_free_memory - new_free_memory)
 
 
+#: Headroom kept outside the cache budget on Volta (sm_70). Triton has no MMA path there:
+#: tl.dot lowers to FMA, those kernels spill registers to local memory, and the driver
+#: reserves local memory for every resident thread (80 SMs x 2048 on a V100). On the first
+#: V100 deploy that grew to ~2.7 GiB outside the torch allocator after graph capture, the
+#: 10% default headroom was gone, and the first request died on Triton's 256 MiB autotune
+#: buffer. Absolute, not a ratio: the reservation scales with SMs, not with VRAM.
+SM70_HEADROOM_BYTES = int(float(os.getenv("FREETOKEN_SM70_HEADROOM_GIB", "6")) * 1024**3)
+
+
+def _sm70_memory_ratio(memory_ratio: float, baseline_free: int, capability: Tuple[int, int],
+                       headroom: int = SM70_HEADROOM_BYTES) -> float:
+    """``memory_ratio`` lowered so at least ``headroom`` bytes stay outside the cache budget
+    on sm_70; unchanged on every other arch or when it already leaves that much."""
+    if capability >= (7, 5) or baseline_free <= 0:
+        return memory_ratio
+    return min(memory_ratio, max(0.1, 1.0 - headroom / baseline_free))
+
+
 def _page_table_width(max_seq_len: int, page_size: int) -> int:
     """Column count for the page table. ``_write_page_table`` writes WHOLE trailing pages, so the
     highest column touched is ``align_ceil(max_seq_len, page_size) - 1`` -- which the 32-alignment
@@ -329,6 +347,15 @@ class Engine:
         init_free_memory = free_max  # startup KV sizing keeps cross-rank MAX (unchanged)
         self._baseline_free = free_min  # rebuild baseline: cross-rank MIN, deterministic across ranks
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
+        ratio = _sm70_memory_ratio(config.memory_ratio, free_min,
+                                   torch.cuda.get_device_capability(self.device))
+        if ratio < config.memory_ratio:
+            logger.warning_rank0(
+                f"sm_70: memory_ratio {config.memory_ratio:.2f} -> {ratio:.2f}, keeping "
+                f"{mem_GB(SM70_HEADROOM_BYTES)} outside the cache budget for Triton's FMA-path "
+                "local memory (FREETOKEN_SM70_HEADROOM_GIB)"
+            )
+            object.__setattr__(config, "memory_ratio", ratio)
 
         # ======================= Model initialization ========================
         set_rope_device(self.device)

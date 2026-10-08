@@ -8,7 +8,7 @@ import torch
 import os
 
 from freetoken.engine.cache_budget import expert_bytes_per_slot, plan_cache_budget, resolve_moe_cache_auto
-from freetoken.engine.engine import _pin_budget_bytes
+from freetoken.engine.engine import _pin_budget_bytes, _sm70_memory_ratio
 
 
 def test_moe_priority_fills_experts_up_to_total():
@@ -567,3 +567,20 @@ def test_without_floor_the_reserve_is_still_a_hard_floor():
 def test_fallback_stops_at_the_floor():
     with pytest.raises(AssertionError, match="budget too small"):
         resolve_moe_cache_auto(**_FALLBACK, kv_reserve_tokens=640, kv_reserve_min_tokens=70)
+
+
+_GIB = 1024**3
+
+
+def test_sm70_keeps_absolute_headroom_outside_the_budget():
+    # V100 32 GB: the 10% default left ~3 GiB, less than Triton's FMA-path local memory.
+    assert _sm70_memory_ratio(0.9, 31 * _GIB, (7, 0), 6 * _GIB) == pytest.approx(1 - 6 / 31)
+    # a ratio that already leaves enough is kept as asked
+    assert _sm70_memory_ratio(0.7, 31 * _GIB, (7, 0), 6 * _GIB) == 0.7
+    # a card smaller than the headroom still gets a usable floor, not a negative ratio
+    assert _sm70_memory_ratio(0.9, 4 * _GIB, (7, 0), 6 * _GIB) == 0.1
+
+
+@pytest.mark.parametrize("capability", [(7, 5), (8, 0), (8, 9), (9, 0), (12, 0)])
+def test_sm70_headroom_leaves_other_archs_alone(capability):
+    assert _sm70_memory_ratio(0.9, 31 * _GIB, capability, 6 * _GIB) == 0.9

@@ -1,7 +1,7 @@
 # Форк Looma под Tesla V100 (sm_70) — тестовый
 
-Ветка `looma/v100` от `v0.1.3-looma25` (`f85e191`), релиз
-`v0.1.3-looma25-v100.1` (pre-release). Основная линия `looma/bf16-experts`, её
+Ветка `looma/v100` от `v0.1.3-looma25` (`f85e191`), релизы
+`v0.1.3-looma25-v100.N` (pre-release). Основная линия `looma/bf16-experts`, её
 релизы и закрепка оркестратора (`FREETOKEN_PIN`) этим не затрагиваются.
 
 ## Почему на V100 не встаёт обычное колесо
@@ -28,7 +28,9 @@
 - `freetoken-kernel-cache/build_backend.py` — архитектура по умолчанию `7.0`.
 - `kernel/triton/activation.py` — `tanh.approx.f32` только с sm_75; на V100
   GELU-tanh считается через `libdevice.tanh`. Остальное ядро то же.
-- `version.py` — `0.1.3+looma25.v100.1`.
+- `engine/engine.py` — на sm_70 вне бюджета кэшей остаётся не меньше 6 ГиБ
+  (`FREETOKEN_SM70_HEADROOM_GIB`), `memory_ratio` снижается под это; см. стенд ниже.
+- `version.py` — `0.1.3+looma25.v100.2`.
 - `scripts/v100/` — сборка, проба и отправка пробы на узел.
 
 ## Сборка
@@ -42,11 +44,12 @@
 
 ## Как ставить на узел
 
-Строки требований (агент на Python 3.12):
+Строки требований (агент на Python 3.12). Kernel-cache — из релиза v100.1: кернелы с
+тех пор не менялись, а колесо кернелов движок сверяет по базовой версии `0.1.3`.
 
     https://download.pytorch.org/whl/cu126/torch-2.11.0%2Bcu126-cp312-cp312-manylinux_2_28_x86_64.whl
     https://download.pytorch.org/whl/cu126/torchvision-0.26.0%2Bcu126-cp312-cp312-manylinux_2_28_x86_64.whl
-    freetoken @ https://github.com/LoomaFloat/freetoken/releases/download/v0.1.3-looma25-v100.1/freetoken-0.1.3%2Blooma25.v100.1-cp312-cp312-linux_x86_64.whl
+    freetoken @ https://github.com/LoomaFloat/freetoken/releases/download/v0.1.3-looma25-v100.2/freetoken-0.1.3%2Blooma25.v100.2-cp312-cp312-linux_x86_64.whl
     https://github.com/LoomaFloat/freetoken/releases/download/v0.1.3-looma25-v100.1/freetoken_kernel_cache-0.1.3%2Bcu126.looma25.v100.1-py3-none-linux_x86_64.whl
     ziglang==0.16.0
 
@@ -66,6 +69,20 @@
 загрузка каждого модуля kernel-cache, matmul bf16/fp16 и активации против torch,
 GPU-тесты `tests/kernels,attention,moe`, затем `ft bench bw` + `ft serve`
 Qwen3-30B-A3B и два запроса. Флаги движку — `--serve-arg=--dtype=float16`.
+
+## Стенд
+
+**2026-10-08, v100.1, Tesla V100-SXM2-32GB (vast, Болгария), Qwen3-30B-A3B bf16,
+деплой из админки.** Окружение собралось, kernel-cache подхватился, веса легли,
+CUDA-графы захвачены (bs 1/2/4), прогрев префилла прошёл за 25.5 с, сервер
+поднялся. Первый же запрос упал: автотюнер Triton для `sampling.softmax` перед
+замером берёт буфер 256 МиБ, а свободно было 190 МиБ. torch занимал ровно свой
+бюджет (28.18 ГиБ = 0.9 от свободной), ещё 3.2 ГиБ — вне аллокатора; сразу
+после захвата графов свободных было 2.97 ГиБ, то есть ~2.7 ГиБ выросло уже
+после. Похоже на локальную память FMA-ядер Triton (на sm_70 у `tl.dot` нет MMA,
+регистры сливаются, драйвер резервирует под все 80×2048 потоков) — это
+гипотеза, на узле не измерено. В v100.2 на sm_70 вне бюджета держится не
+меньше 6 ГиБ.
 
 ## Чего нет и что не проверено
 

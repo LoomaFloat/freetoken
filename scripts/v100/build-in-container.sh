@@ -35,6 +35,11 @@ for v in $PYTHONS; do
   uv build -q --wheel --no-build-isolation --python "$venv/bin/python" -o "$OUT" .
 done
 
+if [ "${FREETOKEN_V100_SKIP_KERNEL_CACHE:-0}" = 1 ]; then
+  ls -la "$OUT"
+  exit 0
+fi
+
 venv="/work/venv$CACHE_PYTHON"
 runtime="$(ls "$OUT"/freetoken-*-cp${CACHE_PYTHON/./}-*.whl | head -1)"
 say "kernel cache: installing $runtime into the $CACHE_PYTHON venv"

@@ -22,16 +22,16 @@ requires-python = ">=3.10"
 license = "Apache-2.0"
 dependencies = ["apache-tvm-ffi==0.1.13.post3"]
 
-# Provenance pin: PyPI's torch 2.11.0 is itself the cu130 build, but this index serves
-# ONLY cu130 wheels, so an isolated build can never resolve a different-CUDA torch and
-# stamp the wheel +cu126/+cu128. uv applies these to build-system.requires when this
+# Provenance pin: on looma/v100 this index serves ONLY cu126 wheels -- the last torch
+# builds that still carry sm_70 -- so an isolated build can never resolve PyPI's cu130
+# torch and stamp the wheel +cu130. uv applies these to build-system.requires when this
 # directory is the build root. Mirrors ../pyproject.toml.
 [tool.uv.sources]
-torch = { index = "pytorch-cu130" }
+torch = { index = "pytorch-cu126" }
 
 [[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
 explicit = true
 
 [tool.setuptools]

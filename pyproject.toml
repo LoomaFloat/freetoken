@@ -92,12 +92,12 @@ accel = ["freetoken[fi,sgl]"]
 # (the torch index also mirrors stale copies of common deps, e.g. packaging<=24.1,
 # which would otherwise shadow PyPI under uv's first-index strategy).
 [tool.uv.sources]
-torch = { index = "pytorch-cu130" }
+torch = { index = "pytorch-cu126" }
 sglang-kernel = { index = "sglang-cu130" }
 
 [[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
 explicit = true
 
 [[tool.uv.index]]

@@ -21,7 +21,7 @@ import triton.language as tl
 from triton.language.extra import libdevice
 from triton.language.extra.cuda import gdc_wait, gdc_launch_dependents
 
-from freetoken.utils.arch import is_sm90_supported
+from freetoken.utils.arch import is_arch_supported, is_sm90_supported
 
 SILU = 0
 GELU = 1
@@ -46,6 +46,12 @@ def _pdl_supported() -> bool:
     # ptxas rejects the intrinsic. The fallback path is exactly where a non-Hopper
     # card (3090 sm_86, 4090/4060 sm_89, A100 sm_80) is most likely, so gate it off.
     return is_sm90_supported()
+
+
+@functools.cache
+def _fast_tanh_supported() -> bool:
+    # tanh.approx.f32 is sm_75+; on sm_70 (V100) ptxas rejects it.
+    return is_arch_supported(7, 5)
 
 
 @triton.jit
@@ -75,6 +81,7 @@ def _act_and_mul_kernel(
     limit,
     ACT: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
+    FAST_TANH: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     # One program handles a contiguous BLOCK_D chunk of one output row.
@@ -100,7 +107,11 @@ def _act_and_mul_kernel(
         y = act * up
     elif ACT == 2:  # GELU_TANH via tanh.approx
         inner = 0.7978845608028654 * (gate + 0.044715 * gate * gate * gate)
-        act = 0.5 * gate * (1.0 + _fast_tanh(inner))
+        if FAST_TANH:
+            t = _fast_tanh(inner)
+        else:
+            t = libdevice.tanh(inner)
+        act = 0.5 * gate * (1.0 + t)
         y = act * up
     elif ACT == 3:  # SWIGLUOAI: clamped gate/up, sigmoid(alpha*gate), (up + 1) bias
         gate = tl.minimum(gate, limit)
@@ -142,7 +153,7 @@ def _act_and_mul(
     num_stages = 2 if block_d == 1024 else 3
     _act_and_mul_kernel[grid](
         o2, x2, d, alpha, limit, ACT=kind, ENABLE_PDL=pdl, launch_pdl=pdl,
-        BLOCK_D=block_d, num_warps=4, num_stages=num_stages,
+        FAST_TANH=_fast_tanh_supported(), BLOCK_D=block_d, num_warps=4, num_stages=num_stages,
     )
     return out
 

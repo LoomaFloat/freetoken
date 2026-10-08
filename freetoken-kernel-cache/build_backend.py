@@ -108,11 +108,13 @@ def _build_jit_cache() -> None:
     #   9.0  -> H100, H800, H20                      (Hopper)
     #   10.0 -> B200, B100, GB200                    (Blackwell, datacenter)
     #   12.0 -> RTX 50 series, RTX PRO 6000 Blackwell (Blackwell, consumer / workstation)
+    # The looma/v100 fork builds for 7.0 (Tesla V100) only, with a CUDA 12.x nvcc:
+    # CUDA 13 can no longer emit sm_70.
     # Override with FREETOKEN_KERNEL_CACHE_ARCHES (space-separated maj.min) or
     # TVM_FFI_CUDA_ARCH_LIST directly. Needs an nvcc that supports every listed arch.
     if "TVM_FFI_CUDA_ARCH_LIST" not in os.environ:
         os.environ["TVM_FFI_CUDA_ARCH_LIST"] = os.getenv(
-            "FREETOKEN_KERNEL_CACHE_ARCHES", "8.0 8.6 8.9 9.0 10.0 12.0"
+            "FREETOKEN_KERNEL_CACHE_ARCHES", "7.0"
         )
     compile_and_package_kernels(
         out_dir=out_dir,
